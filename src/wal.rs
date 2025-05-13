@@ -1,0 +1,176 @@
+use crate::{error::Error, store::Entry};
+
+use std::{
+    fs::File,
+    io::Write,
+    sync::mpsc::{Receiver, SyncSender},
+    thread,
+};
+
+pub struct WalInner {
+    file: Option<File>,
+    rotate_size: u64,
+}
+
+pub struct Wal {
+    sender: Option<SyncSender<Entry>>,
+    err_handler: std::sync::Arc<std::sync::Mutex<Box<dyn Fn(Error) + Send + Sync>>>,
+}
+
+use crate::store::DataType;
+
+impl WalInner {
+    pub fn new() -> Self {
+        WalInner {
+            file: None,
+            rotate_size: 1024 * 1024 * 128, // 128MB
+        }
+    }
+
+    pub fn open(&mut self, path: &str) -> Result<(), Error> {
+        // Open the WAL file
+        let file = File::create(path).map_err(Error::new_wal_file_io_error)?;
+        self.file = Some(file);
+        Ok(())
+    }
+
+    pub fn close(&mut self) -> Result<(), Error> {
+        // Close the WAL file
+        if let Some(file) = self.file.take() {
+            file.sync_all().map_err(Error::new_wal_file_io_error)?;
+        }
+        Ok(())
+    }
+    pub fn batch_write(&mut self, items: &Vec<Entry>) -> Result<(), Error> {
+        // Append data to the stream
+        let mut buffer = Vec::new();
+        for item in items {
+            let data = item.encode();
+            buffer.extend_from_slice(&data);
+        }
+
+        match self.file.as_ref().unwrap().write_all(&buffer) {
+            Ok(_) => {}
+            Err(e) => {
+                return Err(Error::new_wal_file_io_error(e));
+            }
+        }
+        // Flush the file to ensure all data is written
+        self.file
+            .as_ref()
+            .unwrap()
+            .flush()
+            .map_err(Error::new_wal_file_io_error)?;
+
+        // rotate the WAL file if necessary
+        self.try_to_rotate(self.rotate_size)?;
+
+        Ok(())
+    }
+
+    pub fn try_to_rotate(&mut self, rotate_size: u64) -> Result<(), Error> {
+        // Rotate the WAL file
+        if let Some(file) = self.file.as_ref() {
+            let metadata = file.metadata().map_err(Error::new_wal_file_io_error)?;
+            // check if the file size is greater than the rotate size
+            if metadata.len() < rotate_size {
+                return Ok(());
+            }
+            file.sync_all().map_err(Error::new_wal_file_io_error)?;
+            let new_file = File::create("wal_new").map_err(Error::new_wal_file_io_error)?;
+            self.file = Some(new_file);
+        }
+        Ok(())
+    }
+}
+
+impl Wal {
+    pub fn write(&self, item: Entry) -> Result<(), Error> {
+        // Append data to the stream
+        self.sender
+            .as_ref()
+            .unwrap()
+            .send(item)
+            .map_err(|_| Error::WalChannelSendError)?;
+        Ok(())
+    }
+
+    pub fn start(
+        &mut self,
+        mut inner: WalInner,
+        next: SyncSender<Vec<Entry>>,
+    ) -> Result<(), Error> {
+        // Start the WAL with the given sender
+        let (sender, receiver) = std::sync::mpsc::sync_channel(128);
+        self.sender = Some(sender);
+
+        // Spawn a thread to handle the WAL writing
+
+        let err_handler = self.err_handler.clone();
+
+        thread::spawn(move || {
+            loop {
+                let item = receiver.recv().unwrap();
+
+                let mut items = vec![item];
+                loop {
+                    match receiver.try_recv() {
+                        Ok(item) => {
+                            items.push(item);
+                            if items.len() >= 128 {
+                                break;
+                            }
+                        }
+                        Err(_) => {
+                            break;
+                        }
+                    }
+                }
+                // Write the items to the file
+                match inner.batch_write(&items) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        // Handle the error
+                        err_handler.lock().unwrap()(e);
+                        return;
+                    }
+                }
+
+                match next.send(items) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        // Handle the error
+                        println!("Error sending to next: {:?}", e);
+                        err_handler.lock().unwrap()(Error::new_wal_channel_send_error());
+                        return;
+                    }
+                }
+            }
+        });
+
+        Ok(())
+    }
+}
+
+trait Encoder {
+    fn encode(&self) -> Vec<u8>;
+}
+
+impl Encoder for Entry {
+    fn encode(&self) -> Vec<u8> {
+        // Encode the item into bytes
+        let mut data = Vec::new();
+        data.extend_from_slice(&self.version.to_le_bytes());
+
+        if self.version == 1 {
+            data.extend_from_slice(&self.id.to_le_bytes());
+            data.extend_from_slice(&self.stream_id.to_le_bytes());
+            data.extend_from_slice(&self.offset.to_le_bytes());
+            data.extend_from_slice(&(self.data.len() as u64).to_le_bytes());
+            data.extend_from_slice(&self.data);
+        } else {
+            panic!("Unsupported version");
+        }
+        data
+    }
+}
