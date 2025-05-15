@@ -2,14 +2,15 @@ use crate::{error::Error, store::Entry};
 
 use std::{
     fs::File,
-    io::Write,
+    io::{Read, Write},
     sync::mpsc::{Receiver, SyncSender},
     thread,
 };
 
 pub struct WalInner {
-    file: Option<File>,
-    rotate_size: u64,
+    file: File,
+    max_size: u64,
+    index: u64,
 }
 
 pub struct Wal {
@@ -17,30 +18,21 @@ pub struct Wal {
     err_handler: std::sync::Arc<std::sync::Mutex<Box<dyn Fn(Error) + Send + Sync>>>,
 }
 
-use crate::store::DataType;
-
 impl WalInner {
-    pub fn new() -> Self {
+    pub fn new(file: File, max_size: u64, index: u64) -> Self {
         WalInner {
-            file: None,
-            rotate_size: 1024 * 1024 * 128, // 128MB
+            file,
+            index,
+            max_size,
         }
-    }
-
-    pub fn open(&mut self, path: &str) -> Result<(), Error> {
-        // Open the WAL file
-        let file = File::create(path).map_err(Error::new_wal_file_io_error)?;
-        self.file = Some(file);
-        Ok(())
     }
 
     pub fn close(&mut self) -> Result<(), Error> {
         // Close the WAL file
-        if let Some(file) = self.file.take() {
-            file.sync_all().map_err(Error::new_wal_file_io_error)?;
-        }
+        self.file.sync_all().map_err(Error::new_wal_file_io_error)?;
         Ok(())
     }
+
     pub fn batch_write(&mut self, items: &Vec<Entry>) -> Result<(), Error> {
         // Append data to the stream
         let mut buffer = Vec::new();
@@ -49,37 +41,32 @@ impl WalInner {
             buffer.extend_from_slice(&data);
         }
 
-        match self.file.as_ref().unwrap().write_all(&buffer) {
+        match self.file.write_all(&buffer) {
             Ok(_) => {}
             Err(e) => {
                 return Err(Error::new_wal_file_io_error(e));
             }
         }
         // Flush the file to ensure all data is written
-        self.file
-            .as_ref()
-            .unwrap()
-            .flush()
-            .map_err(Error::new_wal_file_io_error)?;
+        self.file.flush().map_err(Error::new_wal_file_io_error)?;
 
         // rotate the WAL file if necessary
-        self.try_to_rotate(self.rotate_size)?;
+        self.try_to_rotate(self.max_size)?;
 
         Ok(())
     }
 
+    // Rotate the WAL file
     pub fn try_to_rotate(&mut self, rotate_size: u64) -> Result<(), Error> {
-        // Rotate the WAL file
-        if let Some(file) = self.file.as_ref() {
-            let metadata = file.metadata().map_err(Error::new_wal_file_io_error)?;
-            // check if the file size is greater than the rotate size
-            if metadata.len() < rotate_size {
-                return Ok(());
-            }
-            file.sync_all().map_err(Error::new_wal_file_io_error)?;
-            let new_file = File::create("wal_new").map_err(Error::new_wal_file_io_error)?;
-            self.file = Some(new_file);
+        let metadata = self.file.metadata().map_err(Error::new_wal_file_io_error)?;
+        // check if the file size is greater than the rotate size
+        if metadata.len() < rotate_size {
+            return Ok(());
         }
+        self.file.sync_all().map_err(Error::new_wal_file_io_error)?;
+
+        // Close the current file
+        self.file = File::create("wal_new").map_err(Error::new_wal_file_io_error)?;
         Ok(())
     }
 }
@@ -101,7 +88,7 @@ impl Wal {
         next: SyncSender<Vec<Entry>>,
     ) -> Result<(), Error> {
         // Start the WAL with the given sender
-        let (sender, receiver) = std::sync::mpsc::sync_channel(128);
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1024);
         self.sender = Some(sender);
 
         // Spawn a thread to handle the WAL writing
@@ -161,16 +148,53 @@ impl Encoder for Entry {
         // Encode the item into bytes
         let mut data = Vec::new();
         data.extend_from_slice(&self.version.to_le_bytes());
-
+        
         if self.version == 1 {
             data.extend_from_slice(&self.id.to_le_bytes());
             data.extend_from_slice(&self.stream_id.to_le_bytes());
-            data.extend_from_slice(&self.offset.to_le_bytes());
-            data.extend_from_slice(&(self.data.len() as u64).to_le_bytes());
+            data.extend_from_slice(&(self.data.len() as u32).to_le_bytes());
             data.extend_from_slice(&self.data);
         } else {
             panic!("Unsupported version");
         }
         data
+    }
+}
+
+trait Decoder {
+    fn decode(&mut self, closure: Box<dyn Fn(Entry)>) -> Result<(), Error>;
+}
+
+impl Decoder for File {
+    fn decode(&mut self, closure: Box<dyn Fn(Entry)>) -> Result<(), Error> {
+        // Decode the item from bytes
+
+        loop {
+            let mut entry = Entry::default();
+            match self.read(&mut entry.version.to_le_bytes()) {
+                Ok(0) => break, // EOF
+                Ok(_) => {}
+                Err(e) => {
+                    return Err(Error::new_wal_file_io_error(e));
+                }
+            }
+            if entry.version == 1 {
+                self.read(&mut entry.id.to_le_bytes())
+                    .map_err(Error::new_wal_file_io_error)?;
+                self.read(&mut entry.stream_id.to_le_bytes())
+                    .map_err(Error::new_wal_file_io_error)?;
+                let data_size = u32::default();
+                self.read(&mut data_size.to_le_bytes())
+                    .map_err(Error::new_wal_file_io_error)?;
+                entry.data.resize(data_size as usize, 0);
+                self.read_exact(&mut entry.data)
+                    .map_err(Error::new_wal_file_io_error)?;
+            } else {
+                return Err(Error::InvalidData);
+            }
+            // Call the closure with the decoded entry
+            closure(entry);
+        }
+        Ok(())
     }
 }

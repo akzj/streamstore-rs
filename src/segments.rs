@@ -71,6 +71,20 @@ impl Segment {
             .ok()
             .map(|index| self.stream_headers()[index].clone())
     }
+
+    pub fn stream_data(&self, stream_id: u64) -> Option<&[u8]> {
+        let stream_header = self.find_stream_header(stream_id)?;
+        let offset = stream_header.file_offset;
+        let size = stream_header.size;
+
+        let data = unsafe {
+            std::slice::from_raw_parts(
+                self.data.as_ptr().add(offset as usize) as *const u8,
+                size as usize,
+            )
+        };
+        Some(data)
+    }
 }
 
 pub fn generate_segment(table: &MemTable, filename: &str) -> Result<Segment, std::io::Error> {
@@ -149,4 +163,8 @@ pub fn generate_segment(table: &MemTable, filename: &str) -> Result<Segment, std
         data: mmap,
     };
     Ok(segment)
+}
+
+pub struct Segments {
+    pub segments: Vec<Segment>,
 }
