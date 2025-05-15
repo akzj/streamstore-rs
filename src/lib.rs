@@ -2,4 +2,5 @@
 pub mod store;
 mod wal;
 mod error;
-mod mem_table;
+mod table;
+mod segments;
