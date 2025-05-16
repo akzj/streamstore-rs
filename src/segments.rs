@@ -1,6 +1,6 @@
-use std::{default, fs::File, io::Write};
+use std::{default, fs::File, io::Write, sync::Arc};
 
-use crate::table::MemTable;
+use crate::{error::Error, table::MemTable};
 
 const SEGMENT_STREAM_HEADER_SIZE: u64 = std::mem::size_of::<SegmentStreamHeader>() as u64;
 const SEGMENT_HEADER_SIZE: u64 = std::mem::size_of::<SegmentHeader>() as u64;
@@ -40,6 +40,34 @@ pub struct Segment {
 }
 
 impl Segment {
+    pub fn new(file: File, file_name: String, data: memmap2::Mmap) -> Self {
+        Segment {
+            file,
+            data,
+            file_name,
+        }
+    }
+
+    pub fn open(file_name: &str) -> Result<Segment, Error> {
+        let file = File::open(file_name).map_err(Error::new_io_error)?;
+        let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(Error::new_io_error)?;
+        let segment = Segment {
+            file,
+            file_name: file_name.to_string(),
+            data: mmap,
+        };
+        Ok(segment)
+    }
+
+    pub fn entry_index(&self) -> (u64, u64) {
+        let header = self.read_header();
+        (header.first_entry, header.last_entry)
+    }
+
+    pub fn file_name(&self) -> &str {
+        &self.file_name
+    }
+
     pub fn read_header(&self) -> SegmentHeader {
         unsafe { &*(self.data.as_ptr() as *const SegmentHeader) }.clone()
     }
@@ -87,28 +115,31 @@ impl Segment {
     }
 }
 
-pub fn generate_segment(table: &MemTable, filename: &str) -> Result<Segment, std::io::Error> {
+pub fn generate_segment(table: &MemTable, filename: &str) -> Result<Segment, Error> {
     assert!(align_of::<SegmentHeader>() <= 8);
 
-    let mut file = File::create(filename)?;
+    let mut file = File::create(filename).map_err(Error::new_io_error)?;
 
     let mut segment_stream_headers = Vec::new();
 
-    table.stream_tables.iter().for_each(|(_, stream_table)| {
-        let stream_header = SegmentStreamHeader {
-            version: SEGMENT_STREAM_HEADER_VERSION_V1,
-            crc_check_sum: 0,
-            file_offset: 0,
-            size: stream_table.size,
-            offset: stream_table.offset,
-            stream_id: stream_table.stream_id,
-        };
-        segment_stream_headers.push(stream_header);
-    });
+    table
+        .get_stream_tables()
+        .iter()
+        .for_each(|(_, stream_table)| {
+            let stream_header = SegmentStreamHeader {
+                version: SEGMENT_STREAM_HEADER_VERSION_V1,
+                crc_check_sum: 0,
+                file_offset: 0,
+                size: stream_table.size,
+                offset: stream_table.offset,
+                stream_id: stream_table.stream_id,
+            };
+            segment_stream_headers.push(stream_header);
+        });
 
     let segment_header = SegmentHeader {
-        first_entry: table.first_entry,
-        last_entry: table.last_entry,
+        first_entry: table.get_first_entry(),
+        last_entry: table.get_last_entry(),
         version: SEGMENT_HEADER_VERSION_V1,
         stream_headers_offset: SEGMENT_STREAM_HEADER_SIZE,
         stream_headers_count: segment_stream_headers.len() as u64,
@@ -122,7 +153,8 @@ pub fn generate_segment(table: &MemTable, filename: &str) -> Result<Segment, std
             &segment_header as *const SegmentHeader as *const u8,
             SEGMENT_HEADER_SIZE as usize,
         )
-    })?;
+    })
+    .map_err(Error::new_io_error)?;
 
     offset += SEGMENT_STREAM_HEADER_SIZE as u64 * segment_stream_headers.len() as u64;
 
@@ -137,26 +169,28 @@ pub fn generate_segment(table: &MemTable, filename: &str) -> Result<Segment, std
                 stream_header as *const SegmentStreamHeader as *const u8,
                 SEGMENT_STREAM_HEADER_SIZE as usize,
             )
-        })?;
+        })
+        .map_err(Error::new_io_error)?;
     }
 
     // Write the stream data to the file
-    for (_, stream_table) in table.stream_tables.iter() {
+    for (_, stream_table) in table.get_stream_tables().iter() {
         for stream_data in stream_table.stream_datas.iter() {
             file.write_all(unsafe {
                 std::slice::from_raw_parts(
                     stream_data.data.as_ptr() as *const u8,
                     stream_data.size() as usize,
                 )
-            })?;
+            })
+            .map_err(Error::new_io_error)?;
         }
     }
-    file.sync_all()?;
+    file.sync_all().map_err(Error::new_io_error)?;
 
     // open file with read only
-    let file = File::open(filename)?;
+    let file = File::open(filename).map_err(Error::new_io_error)?;
 
-    let mmap = unsafe { memmap2::Mmap::map(&file)? };
+    let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(Error::new_io_error)?;
     let segment = Segment {
         file,
         file_name: filename.to_string(),

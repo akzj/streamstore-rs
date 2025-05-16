@@ -15,7 +15,7 @@ pub enum Error {
     #[error("Stream is closed")]
     WalChannelSendError,
     #[error("Stream is closed")]
-    WalFileIoError(std::io::Error),
+    IoError(std::io::Error),
     #[error("Stream offset is invalid")]
     StreamOffsetInvalid,
 }
@@ -40,7 +40,7 @@ impl Error {
     pub fn new_wal_channel_send_error() -> Self {
         Error::WalChannelSendError
     }
-    pub fn new_wal_file_io_error(e: std::io::Error) -> Self {
-        Error::WalFileIoError(e)
+    pub fn new_io_error(e: std::io::Error) -> Self {
+        Error::IoError(e)
     }
 }

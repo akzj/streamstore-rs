@@ -1,5 +1,8 @@
-use core::hash;
-use std::collections::HashMap;
+use core::{hash, sync};
+use std::{
+    collections::HashMap,
+    sync::{Mutex, atomic::AtomicU64},
+};
 
 use crate::{error::Error, store::Entry};
 
@@ -18,14 +21,16 @@ pub struct StreamTable {
     pub stream_datas: Vec<StreamData>,
 }
 
-type GetStreamOffsetHandler = Box<dyn Fn(u64) -> Result<u64, Error>>;
+type GetStreamOffsetHandler = Box<dyn Fn(u64) -> Result<u64, Error> + Send + Send>;
 
+pub type MemTableArc = std::sync::Arc<MemTable>;
+pub type MemTableWeak = std::sync::Weak<MemTable>;
 pub struct MemTable {
-    pub stream_tables: HashMap<u64, StreamTable>,
-    pub first_entry: u64,
-    pub last_entry: u64,
-    pub size: u64,
-    pub get_stream_offset: Option<GetStreamOffsetHandler>,
+    stream_tables: Mutex<HashMap<u64, StreamTable>>,
+    first_entry: AtomicU64,
+    last_entry: AtomicU64,
+    size: AtomicU64,
+    get_stream_offset: Mutex<Option<GetStreamOffsetHandler>>,
 }
 
 impl StreamData {
@@ -40,23 +45,17 @@ impl StreamData {
     // Fill the buffer with data
     // If the buffer is full, return the remaining data
     // If the buffer is not full, return None
-    pub fn fill(&mut self, mut data: Vec<u8>) -> Result<(u64, Option<Vec<u8>>), Error> {
-        let data_len = data.len() as u64;
-        let mut data_remaining = data.len() as u64 - self.cap_remaining();
-        if data_remaining < 0 {
-            data_remaining = 0;
-        }
+    pub fn fill<'a>(&mut self, data: &'a [u8]) -> Result<(u64, Option<&'a [u8]>), Error> {
+        let available = self.cap_remaining().min(data.len() as u64);
+        self.data.extend_from_slice(&data[..available as usize]);
 
-        if data_remaining > 0 {
-            let mut remain_buffer = Vec::with_capacity(data_remaining as usize);
-            remain_buffer.extend_from_slice(&mut data[data_remaining as usize..]);
-            self.data
-                .extend_from_slice(&data[..data_remaining as usize]);
-            return Ok((data_len - data_remaining, Some(remain_buffer)));
+        let remaining_data = if available < data.len() as u64 {
+            Some(&data[available as usize..])
         } else {
-            self.data.append(&mut data);
-            return Ok((data_len, None));
-        }
+            None
+        };
+
+        Ok((available, remaining_data))
     }
 
     pub fn size(&self) -> u64 {
@@ -82,7 +81,7 @@ impl StreamTable {
         }
     }
 
-    pub fn append(&mut self, data: Vec<u8>) -> Result<(), Error> {
+    pub fn append(&mut self, data: &[u8]) -> Result<(), Error> {
         if self.stream_datas.is_empty() || self.stream_datas.last().unwrap().cap_remaining() == 0 {
             self.stream_datas.push(StreamData::new(
                 self.stream_id,
@@ -107,37 +106,72 @@ impl StreamTable {
 impl MemTable {
     pub fn new() -> Self {
         MemTable {
-            stream_tables: HashMap::new(),
-            first_entry: 0,
-            last_entry: 0,
-            size: 0,
-            get_stream_offset: None,
+            stream_tables: Mutex::new(HashMap::new()),
+            first_entry: AtomicU64::new(0),
+            last_entry: AtomicU64::new(0),
+            size: AtomicU64::new(0),
+            get_stream_offset: Mutex::new(None),
         }
     }
 
-    pub fn append(&mut self, entry: Entry) -> Result<(), Error> {
+    pub fn get_first_entry(&self) -> u64 {
+        self.first_entry.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn get_last_entry(&self) -> u64 {
+        self.last_entry.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn get_size(&self) -> u64 {
+        self.size.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn get_stream_tables(&self) -> std::sync::MutexGuard<HashMap<u64, StreamTable>> {
+        self.stream_tables.lock().unwrap()
+    }
+
+    pub fn append(&self, entry: &Entry) -> Result<(), Error> {
         let data_len = entry.data.len() as u64;
 
-        let res = self.stream_tables.get_mut(&entry.stream_id);
+        let mut guard = self.stream_tables.lock().unwrap();
+
+        let res = guard.get_mut(&entry.stream_id);
         if res.is_none() {
-            let offset = match self.get_stream_offset {
+            let offset = match self.get_stream_offset.lock().unwrap().as_ref() {
                 Some(ref handler) => handler(entry.stream_id)?,
                 None => 0,
             };
-            self.stream_tables
+            guard
                 .insert(entry.stream_id, StreamTable::new(entry.stream_id, offset))
                 .unwrap();
         } else {
             // Append the data to the stream table
-            res.unwrap().append(entry.data)?;
+            res.unwrap().append(&entry.data)?;
         }
 
         // Update the stream table
-        self.size += data_len;
-        self.last_entry += entry.id;
-        if self.first_entry == 0 {
-            self.first_entry = entry.id;
+        self.size
+            .fetch_add(data_len, std::sync::atomic::Ordering::SeqCst);
+
+        self.last_entry
+            .store(entry.id, std::sync::atomic::Ordering::SeqCst);
+
+        if self.first_entry.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            self.first_entry
+                .store(entry.id, std::sync::atomic::Ordering::SeqCst);
         }
         Ok(())
+    }
+}
+
+fn assert_send_sync<T: Send + Sync>() {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_stream_data() {
+        assert_send_sync::<MemTable>();
     }
 }
