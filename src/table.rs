@@ -58,6 +58,15 @@ impl StreamData {
         Ok((available, remaining_data))
     }
 
+    pub fn get_stream_range(&self) -> Option<(u64, u64)> {
+        if self.data.is_empty() {
+            return None;
+        }
+        let start = self.offset;
+        let end = self.offset + self.data.len() as u64;
+        Some((start, end))
+    }
+
     pub fn size(&self) -> u64 {
         self.data.len() as u64
     }
@@ -101,6 +110,59 @@ impl StreamTable {
 
         Ok(())
     }
+
+    pub fn get_stream_range(&self) -> Option<(u64, u64)> {
+        if self.stream_datas.is_empty() {
+            return None;
+        }
+        return Some((self.offset, self.offset + self.size));
+    }
+
+    pub fn read_stream_data(&self, offset: u64, size: u64) -> Result<Vec<u8>, Error> {
+        let mut data = Vec::new();
+        let mut offset = offset;
+        let mut size = size;
+
+        // find the first stream data that offset <= offset by quick search
+
+        let res = self.stream_datas.binary_search_by(|stream_data| {
+            if offset < stream_data.offset {
+                std::cmp::Ordering::Greater
+            } else if offset >= stream_data.offset + stream_data.size() {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        });
+        let mut index = match res {
+            Ok(index) => index,
+            Err(index) => index,
+        };
+
+        // read the data from the stream data
+        while index < self.stream_datas.len() {
+            let stream_data = &self.stream_datas[index];
+            let stream_data_offset = stream_data.offset;
+            let stream_data_size = stream_data.size();
+
+            if offset >= stream_data_offset + stream_data_size {
+                index += 1;
+                continue;
+            }
+
+            let start = (offset - stream_data_offset) as usize;
+            let end = (start + size as usize).min(stream_data_size as usize);
+            data.extend_from_slice(&stream_data.data[start..end]);
+
+            size -= (end - start) as u64;
+            if size == 0 {
+                break;
+            }
+            offset = stream_data_offset + stream_data_size;
+        }
+
+        Ok(data)
+    }
 }
 
 impl MemTable {
@@ -128,6 +190,27 @@ impl MemTable {
 
     pub fn get_stream_tables(&self) -> std::sync::MutexGuard<HashMap<u64, StreamTable>> {
         self.stream_tables.lock().unwrap()
+    }
+
+    pub fn get_stream_range(&self, stream_id: u64) -> Option<(u64, u64)> {
+        let guard = self.stream_tables.lock().unwrap();
+        if let Some(stream_table) = guard.get(&stream_id) {
+            return stream_table.get_stream_range();
+        }
+        None
+    }
+
+    pub fn read_stream_data(
+        &self,
+        stream_id: u64,
+        offset: u64,
+        size: u64,
+    ) -> Result<Vec<u8>, Error> {
+        let guard = self.stream_tables.lock().unwrap();
+        if let Some(stream_table) = guard.get(&stream_id) {
+            return stream_table.read_stream_data(offset, size);
+        }
+        Err(Error::StreamNotFound)
     }
 
     pub fn append(&self, entry: &Entry) -> Result<(), Error> {

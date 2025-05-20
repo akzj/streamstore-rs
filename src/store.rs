@@ -10,7 +10,7 @@ use std::{
     u8, vec,
 };
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, access::Access};
 
 use crate::{
     error::Error,
@@ -298,7 +298,8 @@ impl Store for StreamStore {
     }
 
     fn read(&mut self, stream_id: u64, offset: u64, size: u64) -> Result<DataType, Error> {
-        todo!()
+        let inner = self.inner.clone();
+        inner.read(stream_id, offset, size)
     }
 
     fn get_reader(&mut self, stream_id: u64) -> Result<Box<dyn StreamReader>, Error> {
@@ -311,6 +312,28 @@ impl Store for StreamStore {
 
     fn get_stream_range(&mut self, stream_id: u64) -> Result<(u64, u64), Error> {
         todo!()
+    }
+}
+
+impl StreamStoreInner {
+    pub fn read(&self, stream_id: u64, offset: u64, size: u64) -> Result<DataType, Error> {
+        let table = self.table.load();
+        let stream_range = table.get_stream_range(stream_id);
+        if let Some((_start, end)) = stream_range {
+            if offset > end {
+                return Err(Error::new_io_error(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Offset out of range",
+                )));
+            }
+            let data = table.read_stream_data(stream_id, offset, size)?;
+            return Ok(data);
+        }
+
+        Err(Error::new_io_error(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "Stream not found",
+        )))
     }
 }
 

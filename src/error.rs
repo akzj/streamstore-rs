@@ -18,6 +18,9 @@ pub enum Error {
     IoError(std::io::Error),
     #[error("Stream offset is invalid")]
     StreamOffsetInvalid,
+
+    #[error("Stream Not Found")]
+    StreamNotFound,
 }
 
 impl Error {
