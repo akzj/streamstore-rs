@@ -1,6 +1,6 @@
-use std::{default, fs::File, io::Write, sync::Arc};
+use std::{default, fs::File, io::Write, ops::Deref, sync::Arc};
 
-use crate::{error::Error, table::MemTable};
+use crate::{error::Error, mem_table::MemTable};
 
 const SEGMENT_STREAM_HEADER_SIZE: u64 = std::mem::size_of::<SegmentStreamHeader>() as u64;
 const SEGMENT_HEADER_SIZE: u64 = std::mem::size_of::<SegmentHeader>() as u64;
@@ -115,12 +115,25 @@ impl Segment {
     }
 }
 
-pub fn generate_segment(table: &MemTable, filename: &str) -> Result<Segment, Error> {
+pub fn generate_segment(filename: &str, table: &MemTable) -> Result<Segment, Error> {
     assert!(align_of::<SegmentHeader>() <= 8);
 
-    let mut file = File::create(filename).map_err(Error::new_io_error)?;
+    let temp_filename = format!("{}.tmp", filename);
+    let mut file = File::create(&temp_filename).map_err(Error::new_io_error)?;
 
     let mut segment_stream_headers = Vec::new();
+
+    // delete temp file if errors happen
+    let temp_filename_clone = temp_filename.clone();
+    defer::defer!({
+        // check if the file exists
+        if std::fs::metadata(&temp_filename_clone).is_ok() {
+            // delete the file
+            if std::fs::remove_file(&temp_filename_clone).is_err() {
+                log::warn!("Failed to delete temp file: {}", &temp_filename_clone);
+            }
+        }
+    });
 
     table
         .get_stream_tables()
@@ -185,7 +198,16 @@ pub fn generate_segment(table: &MemTable, filename: &str) -> Result<Segment, Err
             .map_err(Error::new_io_error)?;
         }
     }
+
+    // flush the file to disk
+    file.flush().map_err(Error::new_io_error)?;
     file.sync_all().map_err(Error::new_io_error)?;
+
+    // close the file
+    drop(file);
+
+    // rename the file
+    std::fs::rename(temp_filename, filename).map_err(Error::new_io_error)?;
 
     // open file with read only
     let file = File::open(filename).map_err(Error::new_io_error)?;
@@ -196,9 +218,8 @@ pub fn generate_segment(table: &MemTable, filename: &str) -> Result<Segment, Err
         file_name: filename.to_string(),
         data: mmap,
     };
-    Ok(segment)
-}
 
-pub struct Segments {
-    pub segments: Vec<Segment>,
+    // rename the file
+
+    Ok(segment)
 }

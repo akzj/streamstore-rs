@@ -6,19 +6,18 @@ pub enum Error {
     NotFound,
     #[error("Stream already exists")]
     AlreadyExists,
-    #[error("Stream is closed")]
+    #[error("invalid data")]
     InvalidData,
-    #[error("Stream is closed")]
+    #[error("internal error")]
     InternalError,
-    #[error("Stream is closed")]
+    #[error("is closed")]
     CloseError,
-    #[error("Stream is closed")]
+    #[error("channel is closed")]
     WalChannelSendError,
-    #[error("Stream is closed")]
+    #[error("IO error")]
     IoError(std::io::Error),
     #[error("Stream offset is invalid")]
     StreamOffsetInvalid,
-
     #[error("Stream Not Found")]
     StreamNotFound,
 }
