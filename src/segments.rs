@@ -1,4 +1,4 @@
-use std::{default, fs::File, io::Write, ops::Deref, sync::Arc};
+use std::{fs::File, io::Write};
 
 use crate::{error::Error, mem_table::MemTable};
 
@@ -83,6 +83,13 @@ impl Segment {
                 header.stream_headers_count as usize,
             )
         }
+    }
+
+    pub fn get_stream_range(&self, stream_id: u64) -> Option<(u64, u64)> {
+        let stream_header = self.find_stream_header(stream_id)?;
+        let offset = stream_header.file_offset;
+        let size = stream_header.size;
+        Some((offset, offset + size))
     }
 
     pub fn find_stream_header(&self, stream_id: u64) -> Option<SegmentStreamHeader> {

@@ -1,6 +1,6 @@
 use std::{
     fs::{File, OpenOptions},
-    io::{self, Seek},
+    io::{ Seek},
     sync::Arc,
 };
 
@@ -125,7 +125,7 @@ pub fn reload_wals(
         .map_err(Error::new_io_error)?;
 
     // seek to the end of the file
-    file.seek(io::SeekFrom::End(0))
+    file.seek(std::io::SeekFrom::End(0))
         .map_err(Error::new_io_error)?;
 
     // let wal_inner = WalInner::new(file, max_wal_size, wal_path.to_string());

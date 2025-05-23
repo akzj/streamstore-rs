@@ -183,4 +183,13 @@ impl Wal {
             _self.run().unwrap();
         });
     }
+
+    pub fn set_err_handler(
+        &self,
+        err_handler: Box<dyn Fn(Error) + Send + Sync>,
+    ) -> Result<(), Error> {
+        // Set the error handler
+        *self.err_handler.lock().unwrap() = err_handler;
+        Ok(())
+    }
 }

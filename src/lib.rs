@@ -1,11 +1,11 @@
-
-pub mod store;
-mod wal;
-mod error;
-mod table;
-mod segments;
-mod mem_table;
-mod entry;
-mod reload;
 mod config;
+mod entry;
+mod error;
+mod mem_table;
+mod reader;
+mod reload;
+mod segments;
+pub mod store;
+mod table;
+mod wal;
 pub use crate::store::Store;

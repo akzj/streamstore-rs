@@ -1,44 +1,28 @@
-use std::{
-    fmt::Debug,
-    fs::{File, OpenOptions},
-    io::{Seek, SeekFrom},
-    sync::{
-        Arc, Mutex,
-        atomic::{self, AtomicU64},
-        mpsc::{Receiver, SyncSender, sync_channel},
-    },
-    u8, vec,
+use std::sync::{
+    Arc, Mutex,
+    atomic::{self, AtomicU64},
+    mpsc::{Receiver, SyncSender, sync_channel},
 };
 
 use arc_swap::ArcSwap;
-use log::Log;
 
 use crate::{
-    config::Options,
+    config::{self, Config},
     entry::{AppendEntryCallback, DataType, Entry},
     error::Error,
     mem_table::{MemTable, MemTableArc},
+    reader::StreamReader,
     reload::{self, reload_segments},
     segments::{Segment, generate_segment},
     wal::Wal,
 };
 
-pub trait StreamReader {
-    fn read(&mut self, size: u64) -> Result<DataType, Error>;
-    fn offset(&self) -> Result<u64, Error>;
-    fn seek(&mut self, offset: u64) -> Result<(), Error>;
-    fn seek_to_end(&mut self) -> Result<(), Error>;
-    fn seek_to_begin(&mut self) -> Result<(), Error>;
-    fn get_stream_range(&mut self) -> Result<(u64, u64), Error>;
-    fn get_stream_id(&self) -> Result<u64, Error>;
-}
-
 type SegmentArc = Arc<Segment>;
 
 pub struct StreamStoreInner {
     // segment files
-    wal: Mutex<Wal>,
-    options: Options,
+    wal: Wal,
+    config: Config,
     entry_index: AtomicU64,
     table: ArcSwap<MemTable>,
     tables: Mutex<Vec<MemTableArc>>,
@@ -69,7 +53,7 @@ impl Store {
         let id = self
             .entry_index
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        self.wal.lock().unwrap().write(Entry {
+        self.wal.write(Entry {
             version: 1,
             id: id,
             stream_id,
@@ -102,23 +86,74 @@ impl Store {
         todo!()
     }
 
-    fn truncate(&mut self, stream_id: u64, offset: u64) -> Result<(), Error> {
-        todo!()
+    fn get_stream_range(&mut self, stream_id: u64) -> Option<(u64, u64)> {
+        let mut begin = self
+            .segment_files
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|segment| match segment.get_stream_range(stream_id) {
+                Some((begin, _end)) => return Some(begin),
+                None => return None,
+            });
+
+        if begin.is_none() {
+            begin = self.tables.lock().unwrap().iter().find_map(|table| {
+                match table.get_stream_range(stream_id) {
+                    Some((begin, _end)) => return Some(begin),
+                    None => return None,
+                }
+            });
+        }
+
+        if begin.is_none() {
+            begin = match self.table.load().get_stream_range(stream_id) {
+                Some((begin, _end)) => Some(begin),
+                None => None,
+            };
+        }
+
+        if begin.is_none() {
+            return None;
+        }
+
+        // reverse the order
+        let mut end = match self.table.load().get_stream_range(stream_id) {
+            Some((_begin, end)) => Some(end),
+            None => None,
+        };
+
+        if end.is_none() {
+            end = self.tables.lock().unwrap().iter().find_map(|table| {
+                match table.get_stream_range(stream_id) {
+                    Some((_begin, end)) => return Some(end),
+                    None => return None,
+                }
+            });
+        }
+
+        if end.is_none() {
+            end = self
+                .segment_files
+                .lock()
+                .unwrap()
+                .iter()
+                .find_map(|segment| match segment.get_stream_range(stream_id) {
+                    Some((_begin, end)) => return Some(end),
+                    None => return None,
+                });
+        }
+
+        assert!(
+            begin.is_some() && end.is_some(),
+            "Stream range not found for stream_id: {}",
+            stream_id
+        );
+
+        Some((begin.unwrap(), end.unwrap()))
     }
 
-    fn get_stream_range(&mut self, stream_id: u64) -> Result<(u64, u64), Error> {
-        todo!()
-    }
-
-    fn reload_segments(&mut self) -> Result<(), Error> {
-        // read segment file from dir
-        let mut segment_files = self.segment_files.lock().unwrap();
-        *segment_files = reload_segments(&self.options.segment_path)?;
-        // reload segment files
-        Ok(())
-    }
-
-    fn get_last_segment_entry_index(&self) -> Result<u64, Error> {
+    pub fn get_last_segment_entry_index(&self) -> Result<u64, Error> {
         let segment_files = self.segment_files.lock().unwrap();
         if segment_files.is_empty() {
             return Ok(0);
@@ -127,33 +162,7 @@ impl Store {
         Ok(last_segment.entry_index().1)
     }
 
-    pub fn reload_wal(&mut self) -> Result<(), Error> {
-        let (memtable, file) = reload::reload_wals(
-            &self.options.wal_path,
-            self.get_last_segment_entry_index()?,
-            self.options.max_table_size,
-        )?;
-
-        self.table.store(memtable.into());
-
-        let (sender, receiver) = sync_channel::<Vec<Entry>>(100);
-        *self.wal.lock().unwrap() = Wal::new(
-            file,
-            self.options.wal_path.clone(),
-            self.options.max_wal_size,
-            sender,
-            Box::new(|err| {
-                // handle error
-                println!("Error: {}", err);
-            }),
-        );
-
-        *self.entry_receiver.lock().unwrap() = receiver;
-
-        Ok(())
-    }
-
-    pub fn run_segment_generater(&self) -> Result<(), Error> {
+    fn run_segment_generater(&self) -> Result<(), Error> {
         loop {
             if self.is_stop.load(atomic::Ordering::SeqCst) {
                 log::info!("Stop segment generator");
@@ -168,14 +177,14 @@ impl Store {
 
             let mut segment_files_guard = self.segment_files.lock().unwrap();
             segment_files_guard.push(Arc::new(segment));
-            if self.tables.lock().unwrap().len() > self.options.max_tables_count as usize {
+            if self.tables.lock().unwrap().len() > self.config.max_tables_count as usize {
                 self.tables.lock().unwrap().remove(0);
             }
         }
         Ok(())
     }
 
-    pub fn run(&self) -> () {
+    fn run(&self) -> () {
         loop {
             let entries = self.entry_receiver.lock().unwrap().recv();
             if entries.is_err() {
@@ -192,10 +201,10 @@ impl Store {
                 table.append(&entry).unwrap();
 
                 // Check if the table size is greater than the max size
-                if table.get_size() > self.options.max_table_size {
+                if table.get_size() > self.config.max_table_size {
                     self.tables.lock().unwrap().push(table.clone());
                     self.table.store(Arc::new(MemTable::new()));
-                    let filename = std::path::Path::new(&self.options.segment_path)
+                    let filename = std::path::Path::new(&self.config.segment_path)
                         .join(format!("{}.segment", table.get_first_entry()));
                     // notify to create a new segment
                     self.write_segment_sender
@@ -207,13 +216,7 @@ impl Store {
         }
     }
 
-    pub fn reload(&mut self) -> Result<(), Error> {
-        // reload the segments
-        self.reload_segments()?;
-        // start the wal
-        self.reload_wal()?;
-
-        // start the segment generator
+    fn start(&self) -> () {
         let _self = self.clone();
         let _ = std::thread::Builder::new()
             .name("store::run".to_string())
@@ -226,30 +229,56 @@ impl Store {
             .spawn(move || {
                 _self.run_segment_generater().unwrap();
             });
-
-        Ok(())
     }
-}
 
-impl Entry {
-    pub fn default() -> Self {
-        Entry {
-            version: 0,
-            id: 0,
-            stream_id: 0,
-            data: Vec::new(),
-            callback: None,
+    pub fn reload(config: &Config) -> Result<Self, Error> {
+        let (entries_sender, entries_receiver) = sync_channel::<Vec<Entry>>(100);
+
+        let mut last_segment_entry_index = 0;
+        let segment_files = reload_segments(&config.segment_path)?;
+        if !segment_files.is_empty() {
+            last_segment_entry_index = segment_files.last().unwrap().entry_index().1;
         }
-    }
-}
 
-impl Debug for Entry {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Entry")
-            .field("version", &self.version)
-            .field("id", &self.id)
-            .field("stream_id", &self.stream_id)
-            .field("data", &self.data)
-            .finish()
+        let (memtable, file) = reload::reload_wals(
+            &config.wal_path,
+            last_segment_entry_index,
+            config.max_table_size,
+        )?;
+
+        let wal = Wal::new(
+            file,
+            config.wal_path.clone(),
+            config.max_wal_size,
+            entries_sender,
+            Box::new(|err| {
+                // handle error
+                println!("Error: {}", err);
+            }),
+        );
+
+        let (write_segment_sender, write_segment_receiver) =
+            sync_channel::<(String, MemTableArc)>(10);
+
+        let storeinner = StreamStoreInner {
+            wal: wal,
+            config: config.clone(),
+            entry_index: AtomicU64::new(0),
+            table: ArcSwap::new(Arc::new(memtable)),
+            tables: Mutex::new(Vec::new()),
+            segment_files: Mutex::new(segment_files),
+            entry_receiver: Mutex::new(entries_receiver),
+            write_segment_sender: Arc::new(write_segment_sender),
+            write_segment_receiver: Mutex::new(write_segment_receiver),
+            is_stop: atomic::AtomicBool::new(false),
+        };
+
+        // reload the segments
+        let store = Store(Arc::new(storeinner));
+
+        // start background thread
+        store.start();
+
+        Ok((store))
     }
 }

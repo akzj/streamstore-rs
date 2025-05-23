@@ -14,8 +14,6 @@ pub struct Entry {
     pub callback: Option<Box<AppendEntryCallback>>,
 }
 
-
-
 pub trait Encoder {
     fn encode(&self) -> Vec<u8>;
 }
@@ -80,5 +78,28 @@ impl<'a> Decoder<'a> for File {
             }
         }
         Ok(())
+    }
+}
+
+impl Entry {
+    pub fn default() -> Self {
+        Entry {
+            version: 0,
+            id: 0,
+            stream_id: 0,
+            data: Vec::new(),
+            callback: None,
+        }
+    }
+}
+
+impl std::fmt::Debug for Entry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Entry")
+            .field("version", &self.version)
+            .field("id", &self.id)
+            .field("stream_id", &self.stream_id)
+            .field("data", &self.data)
+            .finish()
     }
 }
