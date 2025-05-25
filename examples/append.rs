@@ -1,5 +1,5 @@
 use std::io::Write;
-use std::{io::BufRead, thread::sleep, time::Duration};
+use std::{thread::sleep, time::Duration};
 
 fn main() {
     // Initialize the logger

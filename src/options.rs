@@ -1,4 +1,4 @@
-use crate::{Store, error::Error};
+use crate::Store;
 use anyhow::Result;
 
 #[derive(Clone, Debug)]

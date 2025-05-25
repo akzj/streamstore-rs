@@ -133,7 +133,7 @@ fn test_entry_encode() {
     let mut file = File::create("test_entry.bin").expect("Failed to create file");
     file.write_all(&encoded).expect("Failed to write to file");
 
-    file.flush().expect("Failed to flush file");
+    file.sync_all().expect("Failed to flush file");
     drop(file);
 
     // Read the file back and decode

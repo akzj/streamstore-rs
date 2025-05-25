@@ -11,7 +11,7 @@ use crate::{
     entry::{AppendEntryCallback, DataType, Entry},
     error::Error,
     mem_table::{MemTable, MemTableArc},
-    options::{self, Options},
+    options::Options,
     reader::StreamReader,
     reload::{self, reload_segments},
     segments::{Segment, generate_segment},
