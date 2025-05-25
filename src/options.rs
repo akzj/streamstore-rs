@@ -1,7 +1,8 @@
 use crate::{Store, error::Error};
+use anyhow::Result;
 
-#[derive(Clone)]
-pub struct Config {
+#[derive(Clone, Debug)]
+pub struct Options {
     pub(crate) wal_path: String,
     pub(crate) segment_path: String,
     pub(crate) max_table_size: u64,
@@ -9,19 +10,31 @@ pub struct Config {
     pub(crate) max_tables_count: u64,
 }
 
-impl Default for Config {
+impl Default for Options {
     fn default() -> Self {
-        Config {
-            wal_path: "./wal".to_string(),
-            segment_path: "./segment".to_string(),
+        Options {
+            wal_path: "./data/wal".to_string(),
+            segment_path: "./data/segment".to_string(),
             max_table_size: 128 * 1024 * 1024,
             max_wal_size: 64 * 1024 * 1024,
             max_tables_count: 10,
         }
     }
 }
-
-impl Config {
+impl std::fmt::Display for Options {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Options {{ wal_path: {}, segment_path: {}, max_table_size: {}, max_wal_size: {}, max_tables_count: {} }}",
+            self.wal_path,
+            self.segment_path,
+            self.max_table_size,
+            self.max_wal_size,
+            self.max_tables_count
+        )
+    }
+}
+impl Options {
     pub fn new() -> Self {
         Self::default()
     }
@@ -49,7 +62,7 @@ impl Config {
         &self.wal_path
     }
 
-    pub fn open_store(&self) -> Result<Store, Error> {
+    pub fn open_store(&self) -> Result<Store> {
         let store = Store::reload(self)?;
         Ok(store)
     }

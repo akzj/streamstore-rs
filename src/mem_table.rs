@@ -1,9 +1,9 @@
+use crate::{entry::Entry, error::Error, table::StreamTable};
+use anyhow::Result;
 use std::{
     collections::HashMap,
     sync::{Mutex, atomic::AtomicU64},
 };
-
-use crate::{entry::Entry, error::Error, table::StreamTable};
 
 pub type MemTableArc = std::sync::Arc<MemTable>;
 type GetStreamOffsetHandler = Box<dyn Fn(u64) -> Result<u64, Error> + Send + Send>;
@@ -74,9 +74,7 @@ impl MemTable {
                 Some(ref handler) => handler(entry.stream_id)?,
                 None => 0,
             };
-            guard
-                .insert(entry.stream_id, StreamTable::new(entry.stream_id, offset))
-                .unwrap();
+            guard.insert(entry.stream_id, StreamTable::new(entry.stream_id, offset));
         } else {
             // Append the data to the stream table
             res.unwrap().append(&entry.data)?;

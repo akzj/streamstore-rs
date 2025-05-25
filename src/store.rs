@@ -4,13 +4,14 @@ use std::sync::{
     mpsc::{Receiver, SyncSender, sync_channel},
 };
 
+use anyhow::Result;
 use arc_swap::ArcSwap;
 
 use crate::{
-    config::{self, Config},
     entry::{AppendEntryCallback, DataType, Entry},
     error::Error,
     mem_table::{MemTable, MemTableArc},
+    options::{self, Options},
     reader::StreamReader,
     reload::{self, reload_segments},
     segments::{Segment, generate_segment},
@@ -22,7 +23,7 @@ type SegmentArc = Arc<Segment>;
 pub struct StreamStoreInner {
     // segment files
     wal: Wal,
-    config: Config,
+    config: Options,
     entry_index: AtomicU64,
     table: ArcSwap<MemTable>,
     tables: Mutex<Vec<MemTableArc>>,
@@ -44,25 +45,26 @@ impl std::ops::Deref for Store {
 }
 
 impl Store {
-    fn append(
+    pub fn append(
         &self,
         stream_id: u64,
         data: DataType,
-        callback: Box<AppendEntryCallback>,
-    ) -> Result<(), Error> {
+        callback: Option<Box<AppendEntryCallback>>,
+    ) -> Result<()> {
         let id = self
             .entry_index
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
         self.wal.write(Entry {
             version: 1,
             id: id,
             stream_id,
             data,
-            callback: Some(callback),
+            callback: callback,
         })
     }
 
-    fn read(&mut self, stream_id: u64, offset: u64, size: u64) -> Result<DataType, Error> {
+    pub fn read(&mut self, stream_id: u64, offset: u64, size: u64) -> Result<DataType, Error> {
         let table = self.table.load();
         let stream_range = table.get_stream_range(stream_id);
         if let Some((_start, end)) = stream_range {
@@ -86,7 +88,7 @@ impl Store {
         todo!()
     }
 
-    fn get_stream_range(&mut self, stream_id: u64) -> Option<(u64, u64)> {
+    pub fn get_stream_range(&mut self, stream_id: u64) -> Option<(u64, u64)> {
         let mut begin = self
             .segment_files
             .lock()
@@ -153,7 +155,7 @@ impl Store {
         Some((begin.unwrap(), end.unwrap()))
     }
 
-    pub fn get_last_segment_entry_index(&self) -> Result<u64, Error> {
+    fn get_last_segment_entry_index(&self) -> Result<u64, Error> {
         let segment_files = self.segment_files.lock().unwrap();
         if segment_files.is_empty() {
             return Ok(0);
@@ -217,6 +219,8 @@ impl Store {
     }
 
     fn start(&self) -> () {
+        self.wal.start();
+
         let _self = self.clone();
         let _ = std::thread::Builder::new()
             .name("store::run".to_string())
@@ -231,7 +235,7 @@ impl Store {
             });
     }
 
-    pub fn reload(config: &Config) -> Result<Self, Error> {
+    pub fn reload(config: &Options) -> Result<Self> {
         let (entries_sender, entries_receiver) = sync_channel::<Vec<Entry>>(100);
 
         let mut last_segment_entry_index = 0;
@@ -246,10 +250,12 @@ impl Store {
             config.max_table_size,
         )?;
 
+        let last_log_entry = memtable.get_last_entry();
         let wal = Wal::new(
             file,
             config.wal_path.clone(),
             config.max_wal_size,
+            last_log_entry,
             entries_sender,
             Box::new(|err| {
                 // handle error
@@ -257,13 +263,15 @@ impl Store {
             }),
         );
 
+        log::info!("last log entry: {}", last_log_entry);
+
         let (write_segment_sender, write_segment_receiver) =
             sync_channel::<(String, MemTableArc)>(10);
 
         let storeinner = StreamStoreInner {
             wal: wal,
             config: config.clone(),
-            entry_index: AtomicU64::new(0),
+            entry_index: AtomicU64::new(last_log_entry + 1),
             table: ArcSwap::new(Arc::new(memtable)),
             tables: Mutex::new(Vec::new()),
             segment_files: Mutex::new(segment_files),
@@ -279,6 +287,6 @@ impl Store {
         // start background thread
         store.start();
 
-        Ok((store))
+        Ok(store)
     }
 }

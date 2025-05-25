@@ -2,11 +2,11 @@ use crate::{
     entry::{Encoder, Entry},
     error::Error,
 };
+use anyhow::{Context, Result};
 
 use std::{
-    cell::Cell,
     fs::File,
-    io::{Read, Write},
+    io::Write,
     sync::{
         Arc, Mutex, atomic,
         mpsc::{Receiver, SyncSender},
@@ -152,6 +152,7 @@ impl Wal {
         file: File,
         dir: String,
         max_size: u64,
+        last_entry: u64,
         next: SyncSender<Vec<Entry>>,
         err_handler: Box<dyn Fn(Error) + Send + Sync>,
     ) -> Self {
@@ -160,7 +161,7 @@ impl Wal {
             file: Mutex::new(file),
             dir,
             max_size,
-            last_entry: atomic::AtomicU64::new(0),
+            last_entry: atomic::AtomicU64::new(last_entry),
             sender,
             next,
             receiver: Mutex::new(receiver),
@@ -168,20 +169,20 @@ impl Wal {
         }))
     }
 
-    pub fn write(&self, item: Entry) -> Result<(), Error> {
+    pub fn write(&self, item: Entry) -> Result<()> {
         // Append data to the stream
-        self.sender
-            .send(item)
-            .map_err(|_| Error::WalChannelSendError)?;
+        self.sender.send(item).context("wal sender error")?;
         Ok(())
     }
 
     pub fn start(&self) -> () {
         // Start the WAL with the given sender
         let _self = self.clone();
-        thread::spawn(move || {
-            _self.run().unwrap();
-        });
+        let _ = thread::Builder::new()
+            .name("wals write thread".into())
+            .spawn(move || {
+                _self.run().unwrap();
+            });
     }
 
     pub fn set_err_handler(

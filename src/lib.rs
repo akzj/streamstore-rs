@@ -1,7 +1,7 @@
-mod config;
 mod entry;
 mod error;
 mod mem_table;
+pub mod options;
 mod reader;
 mod reload;
 mod segments;

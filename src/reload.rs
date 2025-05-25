@@ -1,6 +1,7 @@
+use anyhow::{Context, Result};
 use std::{
     fs::{File, OpenOptions},
-    io::{ Seek},
+    io::Seek,
     sync::Arc,
 };
 
@@ -11,9 +12,16 @@ use crate::{
     segments::{Segment, generate_segment},
 };
 
-pub fn reload_segments(segment_path: &str) -> Result<Vec<Arc<Segment>>, Error> {
+pub fn reload_segments(segment_path: &str) -> Result<Vec<Arc<Segment>>> {
+    // Check if the segment path exists
+    if !std::path::Path::new(segment_path).exists() {
+        // create the segment path if it does not exist
+        std::fs::create_dir_all(segment_path).context("Failed to create segment directory")?;
+        log::info!("Segment directory created: {}", segment_path);
+    }
+
     let mut segment_files = vec![];
-    for entry in std::fs::read_dir(&segment_path).map_err(Error::new_io_error)? {
+    for entry in std::fs::read_dir(&segment_path).context("Failed to read segment directory")? {
         let entry = entry.map_err(Error::new_io_error)?;
         if !entry.file_type().map_err(Error::new_io_error)?.is_file() {
             continue;
@@ -40,13 +48,17 @@ pub fn reload_segments(segment_path: &str) -> Result<Vec<Arc<Segment>>, Error> {
     Ok(segment_files)
 }
 
-fn list_wal_files(wal_path: &str) -> Result<Vec<(String, u64)>, Error> {
+fn list_wal_files(wal_path: &str) -> Result<Vec<(String, u64)>> {
     let mut wals = vec![];
 
     // read file from wal dir
-    for entry in std::fs::read_dir(&wal_path).map_err(Error::new_io_error)? {
-        let entry = entry.map_err(Error::new_io_error)?;
-        if !entry.file_type().map_err(Error::new_io_error)?.is_file() {
+    for entry in std::fs::read_dir(&wal_path).context("read wals dir failed")? {
+        let entry = entry.context("read dir entry")?;
+        if !entry
+            .file_type()
+            .context("read dir entry file_type")?
+            .is_file()
+        {
             continue;
         }
         //segment path join file name
@@ -75,6 +87,8 @@ fn list_wal_files(wal_path: &str) -> Result<Vec<(String, u64)>, Error> {
         }
     }
     wals.sort_by(|a, b| a.1.cmp(&b.1));
+
+    log::info!("list wals success,files {:?}", wals);
     Ok(wals)
 }
 
@@ -82,7 +96,14 @@ pub fn reload_wals(
     wal_path: &str,
     last_segment_entry_index: u64,
     max_table_size: u64,
-) -> Result<(MemTable, File), Error> {
+) -> Result<(MemTable, File)> {
+    // Check if the WAL path exists
+    if !std::path::Path::new(wal_path).exists() {
+        // create the wal path if it does not exist
+        std::fs::create_dir_all(wal_path).context("Failed to create WAL directory")?;
+        log::info!("WAL directory created: {}", wal_path);
+    }
+
     let wals = list_wal_files(wal_path)?;
     let mut entry_index = 0;
     let mut table = MemTable::new();

@@ -1,6 +1,12 @@
-use std::{fs::File, io::Read};
+use std::{
+    fs::File,
+    io::{Read, Write},
+};
+
+use anyhow::anyhow;
 
 use crate::error::Error;
+use anyhow::{Context, Result};
 
 pub type AppendEntryCallback = dyn Fn(Result<u64, Error>) -> () + Send + Sync;
 pub type DataType = Vec<u8>;
@@ -37,40 +43,48 @@ impl Encoder for Entry {
 }
 
 pub trait Decoder<'a> {
-    fn decode(
-        &mut self,
-        closure: Box<dyn FnMut(Entry) -> Result<bool, Error> + 'a>,
-    ) -> Result<(), Error>;
+    fn decode(&mut self, closure: Box<dyn FnMut(Entry) -> Result<bool, Error> + 'a>) -> Result<()>;
 }
 
 impl<'a> Decoder<'a> for File {
     fn decode(
         &mut self,
         mut closure: Box<dyn FnMut(Entry) -> Result<bool, Error> + 'a>,
-    ) -> Result<(), Error> {
+    ) -> Result<()> {
         // Decode the item from bytes
         loop {
             let mut entry = Entry::default();
-            match self.read(&mut entry.version.to_le_bytes()) {
-                Ok(0) => break, // EOF
-                Ok(_) => {}
-                Err(e) => {
-                    return Err(Error::new_io_error(e));
+
+            let mut version = [0u8; 1];
+            match self.read_exact(&mut version) {
+                Ok(()) => {
+                    entry.version = u8::from_le_bytes(version);
                 }
+                Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break, // End of file
+                Err(e) => return Err(anyhow!(e)),
             }
             if entry.version == 1 {
-                self.read(&mut entry.id.to_le_bytes())
-                    .map_err(Error::new_io_error)?;
-                self.read(&mut entry.stream_id.to_le_bytes())
-                    .map_err(Error::new_io_error)?;
-                let data_size = u32::default();
-                self.read(&mut data_size.to_le_bytes())
-                    .map_err(Error::new_io_error)?;
+                let mut id_buf = [0u8; 8];
+                self.read_exact(&mut id_buf).context("")?;
+                entry.id = u64::from_le_bytes(id_buf);
+
+                let mut stream_id_buf = [0u8; 8];
+                self.read_exact(&mut stream_id_buf)
+                    .context("Failed to read stream_id")?;
+                entry.stream_id = u64::from_le_bytes(stream_id_buf);
+
+                let mut data_size_buf = [0u8; 4];
+                self.read_exact(&mut data_size_buf)
+                    .context("Failed to read data size")?;
+
+                let data_size = u32::from_le_bytes(data_size_buf);
+
                 entry.data.resize(data_size as usize, 0);
                 self.read_exact(&mut entry.data)
                     .map_err(Error::new_io_error)?;
             } else {
-                return Err(Error::InvalidData);
+                log::error!("Unsupported version: {}", entry.version);
+                return Err(anyhow!(Error::InvalidData));
             }
             // Call the closure with the decoded entry
             if !closure(entry)? {
@@ -102,4 +116,38 @@ impl std::fmt::Debug for Entry {
             .field("data", &self.data)
             .finish()
     }
+}
+
+#[test]
+fn test_entry_encode() {
+    let entry = Entry {
+        version: 1,
+        id: 1,
+        stream_id: 1,
+        data: "hello world".as_bytes().to_vec(),
+        callback: None,
+    };
+    let encoded = entry.encode();
+
+    // write the encoded data to a file
+    let mut file = File::create("test_entry.bin").expect("Failed to create file");
+    file.write_all(&encoded).expect("Failed to write to file");
+
+    file.flush().expect("Failed to flush file");
+    drop(file);
+
+    // Read the file back and decode
+    let mut file = File::open("test_entry.bin").expect("Failed to open file");
+
+    let meta = file.metadata().expect("Failed to read metadata");
+    assert!(meta.len() > 0, "File should not be empty");
+
+    file.decode(Box::new(|decoded_entry| {
+        assert_eq!(decoded_entry.version, 1);
+        assert_eq!(decoded_entry.id, 1);
+        assert_eq!(decoded_entry.stream_id, 1);
+        assert_eq!(decoded_entry.data, b"hello world");
+        Ok(true)
+    }))
+    .expect("Failed to decode entry");
 }

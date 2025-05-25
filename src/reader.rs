@@ -1,4 +1,5 @@
 use crate::{entry::DataType, error::Error};
+use anyhow::Result;
 
 pub trait StreamReader {
     fn read(&mut self, size: u64) -> Result<DataType, Error>;

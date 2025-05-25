@@ -1,10 +1,5 @@
-use core::{hash, sync};
-use std::{
-    collections::HashMap,
-    sync::{Mutex, atomic::AtomicU64},
-};
-
-use crate::{entry::Entry, error::Error};
+use crate::error::Error;
+use anyhow::Result;
 
 const STREAM_DATA_BUFFER_CAP: u64 = 1024 * 128; // 128KB
 

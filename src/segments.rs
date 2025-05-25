@@ -1,6 +1,6 @@
-use std::{fs::File, io::Write};
-
 use crate::{error::Error, mem_table::MemTable};
+use anyhow::Result;
+use std::{fs::File, io::Write};
 
 const SEGMENT_STREAM_HEADER_SIZE: u64 = std::mem::size_of::<SegmentStreamHeader>() as u64;
 const SEGMENT_HEADER_SIZE: u64 = std::mem::size_of::<SegmentHeader>() as u64;
