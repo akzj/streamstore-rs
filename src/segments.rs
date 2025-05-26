@@ -14,27 +14,27 @@ const SEGMENT_HEADER_VERSION_V1: u64 = 1;
 #[derive(Default, Debug, Clone)]
 #[repr(C)]
 pub struct SegmentStreamHeader {
-    pub version: u64,
+    pub(crate) version: u64,
     // The stream id
-    pub stream_id: u64,
+    pub(crate) stream_id: u64,
     // The offset of the stream
-    pub offset: u64,
+    pub(crate) offset: u64,
     // The offset of the stream in the file
-    pub file_offset: u64,
+    pub(crate) file_offset: u64,
     // The size of the stream in the file
-    pub size: u64,
+    pub(crate) size: u64,
     // checksum of the stream
-    pub crc_check_sum: u64,
+    pub(crate) crc_check_sum: u64,
 }
 
 #[derive(Default, Clone, Debug)]
 #[repr(C)]
 pub struct SegmentHeader {
-    version: u64,
-    last_entry: u64,
-    first_entry: u64,
-    stream_headers_offset: u64,
-    stream_headers_count: u64,
+    pub(crate) version: u64,
+    pub(crate) last_entry: u64,
+    pub(crate) first_entry: u64,
+    pub(crate) stream_headers_offset: u64,
+    pub(crate) stream_headers_count: u64,
 }
 
 pub struct Segment {
@@ -76,7 +76,7 @@ impl Segment {
         unsafe { &*(self.data.as_ptr() as *const SegmentHeader) }.clone()
     }
 
-    fn stream_headers(&self) -> &[SegmentStreamHeader] {
+    pub fn get_stream_headers(&self) -> &[SegmentStreamHeader] {
         let header = self.read_header();
         unsafe {
             std::slice::from_raw_parts(
@@ -97,7 +97,7 @@ impl Segment {
     }
 
     pub fn find_stream_header(&self, stream_id: u64) -> Option<SegmentStreamHeader> {
-        self.stream_headers()
+        self.get_stream_headers()
             .binary_search_by(|b| {
                 if b.stream_id < stream_id {
                     std::cmp::Ordering::Less
@@ -108,7 +108,7 @@ impl Segment {
                 }
             })
             .ok()
-            .map(|index| self.stream_headers()[index].clone())
+            .map(|index| self.get_stream_headers()[index].clone())
     }
 
     pub fn stream_data(&self, stream_id: u64) -> Option<&[u8]> {

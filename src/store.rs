@@ -13,9 +13,9 @@ use anyhow::Result;
 use arc_swap::ArcSwap;
 
 use crate::{
-    entry::{AppendEntryCallback, DataType, Entry},
+    entry::{AppendEntryResultFn, DataType, Entry},
     error::Error,
-    mem_table::{MemTable, MemTableArc},
+    mem_table::{GetStreamOffsetFn, MemTable, MemTableArc},
     options::Options,
     reader::StreamReader,
     reload::{self, reload_segments},
@@ -32,9 +32,9 @@ pub struct StreamStoreInner {
     config: Options,
     entry_index: AtomicU64,
     table: ArcSwap<MemTable>,
-    tables: Mutex<Vec<MemTableArc>>,
+    mem_tables: Mutex<Vec<MemTableArc>>,
     segment_files: Mutex<Vec<SegmentArc>>,
-    offsets: Mutex<HashMap<u64, u64>>,
+    offsets: Arc<Mutex<HashMap<u64, u64>>>,
     entry_receiver: Mutex<Receiver<Vec<Entry>>>,
     write_segment_sender: Arc<SyncSender<(path::PathBuf, MemTableArc)>>,
     write_segment_receiver: Mutex<Receiver<(path::PathBuf, MemTableArc)>>,
@@ -56,7 +56,7 @@ impl Store {
         &self,
         stream_id: u64,
         data: DataType,
-        callback: Option<AppendEntryCallback>,
+        callback: Option<AppendEntryResultFn>,
     ) -> Result<()> {
         let id = self
             .entry_index
@@ -96,7 +96,7 @@ impl Store {
         };
 
         if end.is_none() {
-            end = self.tables.lock().unwrap().iter().find_map(|table| {
+            end = self.mem_tables.lock().unwrap().iter().find_map(|table| {
                 match table.get_stream_range(stream_id) {
                     Some((_begin, end)) => return Some(end),
                     None => return None,
@@ -133,7 +133,7 @@ impl Store {
             });
 
         if begin.is_none() {
-            begin = self.tables.lock().unwrap().iter().find_map(|table| {
+            begin = self.mem_tables.lock().unwrap().iter().find_map(|table| {
                 match table.get_stream_range(stream_id) {
                     Some((begin, _end)) => return Some(begin),
                     None => return None,
@@ -155,7 +155,8 @@ impl Store {
     }
 
     pub fn get_stream_range(&mut self, stream_id: u64) -> Result<(u64, u64)> {
-        match self.get_stream_begin(stream_id) {
+        let res = self.get_stream_begin(stream_id);
+        match res {
             Ok(begin) => match self.get_stream_end(stream_id) {
                 Ok(end) => Ok((begin, end)),
                 Err(e) => return Err(e),
@@ -164,7 +165,7 @@ impl Store {
         }
     }
 
-    fn get_last_segment_entry_index(&self) -> Result<u64, Error> {
+    fn get_last_segment_entry_index(&self) -> Result<u64> {
         let segment_files = self.segment_files.lock().unwrap();
         if segment_files.is_empty() {
             return Ok(0);
@@ -173,7 +174,62 @@ impl Store {
         Ok(last_segment.entry_index().1)
     }
 
-    fn run_segment_generater(&self) -> Result<(), Error> {
+    fn reload_offset(&self) {
+        // reload the segments
+        for segment in self.segment_files.lock().unwrap().iter() {
+            for stream_header in segment.get_stream_headers() {
+                let stream_id = stream_header.stream_id;
+                let offset = stream_header.offset + stream_header.size;
+                self.offsets.lock().unwrap().insert(stream_id, offset);
+                log::info!(
+                    "Reloaded stream {} with offset {} from segment ",
+                    stream_id,
+                    offset
+                );
+            }
+        }
+
+        // reload the memtable
+        for mem_table in self.mem_tables.lock().unwrap().iter() {
+            let stream_tables = mem_table.get_stream_tables();
+            for (stream_id, stream_table) in &*stream_tables {
+                match stream_table.get_stream_range() {
+                    Some((_begin, end)) => {
+                        self.offsets.lock().unwrap().insert(stream_id.clone(), end);
+                        log::info!(
+                            "Reloaded stream {} with offset {} from memtable",
+                            stream_id,
+                            end
+                        );
+                    }
+                    None => {
+                        log::warn!("Stream {} not found in memtable", stream_id);
+                    }
+                }
+            }
+        }
+
+        //reload from the memtable
+        let memtable = self.table.load();
+        let stream_tables = memtable.get_stream_tables();
+        for (stream_id, stream_table) in &*stream_tables {
+            match stream_table.get_stream_range() {
+                Some((_begin, end)) => {
+                    self.offsets.lock().unwrap().insert(stream_id.clone(), end);
+                    log::info!(
+                        "Reloaded stream {} with offset {} from memtable",
+                        stream_id,
+                        end
+                    );
+                }
+                None => {
+                    log::warn!("Stream {} not found in memtable", stream_id);
+                }
+            }
+        }
+    }
+
+    fn run_segment_generater(&self) -> Result<()> {
         loop {
             if self.is_readonly.load(atomic::Ordering::SeqCst) {
                 log::info!("Stop segment generator");
@@ -188,14 +244,22 @@ impl Store {
 
             let mut segment_files_guard = self.segment_files.lock().unwrap();
             segment_files_guard.push(Arc::new(segment));
-            if self.tables.lock().unwrap().len() > self.config.max_tables_count as usize {
-                self.tables.lock().unwrap().remove(0);
+            if self.mem_tables.lock().unwrap().len() > self.config.max_tables_count as usize {
+                self.mem_tables.lock().unwrap().remove(0);
             }
         }
         Ok(())
     }
 
     fn run(&self) -> () {
+        let get_stream_offset_fn: GetStreamOffsetFn = Arc::new(Box::new({
+            let offsets = self.offsets.clone();
+            move |stream_id| match offsets.lock().unwrap().get(&stream_id) {
+                Some(offset) => Ok(*offset),
+                None => Ok(0), // Default to 0 if not found
+            }
+        }));
+
         loop {
             let entries = self.entry_receiver.lock().unwrap().recv();
             if entries.is_err() {
@@ -227,8 +291,10 @@ impl Store {
 
                 // Check if the table size is greater than the max size
                 if table.get_size() > self.config.max_table_size {
-                    self.tables.lock().unwrap().push(table.clone());
-                    self.table.store(Arc::new(MemTable::new()));
+                    self.mem_tables.lock().unwrap().push(table.clone());
+                    self.table
+                        .store(Arc::new(MemTable::new(&get_stream_offset_fn.clone())));
+
                     let filename = std::path::Path::new(&self.config.segment_path)
                         .join(format!("{}.seg", table.get_first_entry()));
                     // notify to create a new segment
@@ -242,6 +308,16 @@ impl Store {
     }
 
     pub fn reload(config: &Options) -> Result<Self> {
+        let offset_map = Arc::new(Mutex::new(HashMap::new()));
+
+        let get_stream_offset_fn: GetStreamOffsetFn = Arc::new(Box::new({
+            let offset_map = offset_map.clone();
+            move |stream_id| match offset_map.lock().unwrap().get(&stream_id) {
+                Some(offset) => Ok(*offset),
+                None => Ok(0), // Default to 0 if not found
+            }
+        }));
+
         let (entries_sender, entries_receiver) = sync_channel::<Vec<Entry>>(100);
 
         let mut last_segment_entry_index = 0;
@@ -254,6 +330,7 @@ impl Store {
             &config.wal_path,
             last_segment_entry_index,
             config.max_table_size,
+            get_stream_offset_fn,
         )?;
         let memtable = memtables.pop().unwrap();
 
@@ -295,23 +372,23 @@ impl Store {
         // unwrap the Rc to get the inner memtable
         let memtable = Rc::into_inner(memtable).unwrap();
 
-        let storeinner = StreamStoreInner {
+        let inner = StreamStoreInner {
             wal: wal,
             config: config.clone(),
             entry_index: AtomicU64::new(last_log_entry + 1),
             table: ArcSwap::new(Arc::new(memtable)),
-            tables: Mutex::new(Vec::new()),
+            mem_tables: Mutex::new(Vec::new()),
             segment_files: Mutex::new(segment_files),
             entry_receiver: Mutex::new(entries_receiver),
             write_segment_sender: Arc::new(write_segment_sender),
             write_segment_receiver: Mutex::new(write_segment_receiver),
-            offsets: Mutex::new(HashMap::new()),
+            offsets: offset_map.clone(),
             is_readonly: is_readonly.clone(),
         };
 
-        // reload the segments
-        let store = Store(Arc::new(storeinner));
+        let store = Store(Arc::new(inner));
 
+        store.reload_offset();
         // start background thread
         store.start();
 

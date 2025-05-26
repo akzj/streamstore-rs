@@ -2,27 +2,27 @@ use crate::{entry::Entry, error::Error, table::StreamTable};
 use anyhow::Result;
 use std::{
     collections::HashMap,
-    sync::{Mutex, atomic::AtomicU64},
+    sync::{Arc, Mutex, atomic::AtomicU64},
 };
 
-pub type MemTableArc = std::sync::Arc<MemTable>;
-type GetStreamOffsetHandler = Box<dyn Fn(u64) -> Result<u64, Error> + Send + Send>;
+pub type MemTableArc = Arc<MemTable>;
+pub(crate) type GetStreamOffsetFn = Arc<Box<dyn Fn(u64) -> Result<u64> + Send + Sync>>;
 pub struct MemTable {
     stream_tables: Mutex<HashMap<u64, StreamTable>>,
     first_entry: AtomicU64,
     last_entry: AtomicU64,
     size: AtomicU64,
-    get_stream_offset: Mutex<Option<GetStreamOffsetHandler>>,
+    get_stream_offset_fn: Mutex<GetStreamOffsetFn>,
 }
 
 impl MemTable {
-    pub fn new() -> Self {
+    pub fn new(get_stream_offset_fn: &GetStreamOffsetFn) -> Self {
         MemTable {
             stream_tables: Mutex::new(HashMap::new()),
             first_entry: AtomicU64::new(0),
             last_entry: AtomicU64::new(0),
             size: AtomicU64::new(0),
-            get_stream_offset: Mutex::new(None),
+            get_stream_offset_fn: Mutex::new(get_stream_offset_fn.clone()),
         }
     }
 
@@ -67,16 +67,9 @@ impl MemTable {
         let res = match guard.get_mut(&entry.stream_id) {
             Some(stream_table) => stream_table,
             None => {
-                let offset = match self.get_stream_offset.lock().unwrap().as_ref() {
-                    Some(ref handler) => handler(entry.stream_id)?,
-                    None => {
-                        // If no handler is set, default to 0
-                        log::warn!(
-                            "No get_stream_offset handler set, using default offset for stream_id: {}",
-                            entry.stream_id
-                        );
-                        0
-                    }
+                let offset = match self.get_stream_offset_fn.lock().unwrap()(entry.stream_id) {
+                    Ok(offset) => offset,
+                    Err(e) => return Err(e),
                 };
                 guard.insert(entry.stream_id, StreamTable::new(entry.stream_id, offset));
                 guard.get_mut(&entry.stream_id).unwrap()

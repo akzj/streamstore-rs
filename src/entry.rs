@@ -8,7 +8,7 @@ use anyhow::anyhow;
 use crate::error::Error;
 use anyhow::{Context, Result};
 
-pub type AppendEntryCallback = Box<dyn Fn(Result<u64>) -> () + Send + Sync>;
+pub type AppendEntryResultFn = Box<dyn Fn(Result<u64>) -> () + Send + Sync>;
 pub type DataType = Vec<u8>;
 
 pub struct Entry {
@@ -17,7 +17,7 @@ pub struct Entry {
     pub id: u64,
     pub stream_id: u64,
     pub data: DataType,
-    pub callback: Option<AppendEntryCallback>,
+    pub callback: Option<AppendEntryResultFn>,
 }
 
 pub trait Encoder {

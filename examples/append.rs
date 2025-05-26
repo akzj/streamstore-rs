@@ -1,7 +1,7 @@
 use std::io::Write;
 use std::sync::{Arc, Condvar, Mutex};
 use std::{thread::sleep, time::Duration};
-use streamstore::entry::AppendEntryCallback;
+use streamstore::entry::AppendEntryResultFn;
 fn main() {
     // Initialize the logger
     // env_logger::init();
@@ -34,18 +34,24 @@ fn main() {
     let cond = Arc::new((Mutex::new(0 as u64), Condvar::new()));
 
     let make_callback = |cond: Arc<(Mutex<u64>, Condvar)>| {
+        let cond_clone = cond.clone();
+        // Increment the count in the condition variable
+        let (lock, _) = &*cond_clone;
+        let mut count = lock.lock().unwrap();
+        *count += 1;
+
         Some(Box::new(move |result| match result {
             Ok(entry) => {
                 log::info!("Append success: {:?}", entry);
                 let (lock, cvar) = &*cond;
                 let mut count = lock.lock().unwrap();
-                *count += 1;
+                *count -= 1;
                 cvar.notify_all();
             }
             Err(e) => {
                 log::error!("Append failed: {:?}", e);
             }
-        }) as AppendEntryCallback)
+        }) as AppendEntryResultFn)
     };
 
     store
@@ -61,5 +67,12 @@ fn main() {
         .append(1, "hello world".into(), make_callback(cond.clone()))
         .unwrap();
 
-    sleep(Duration::from_secs(3));
+    // Wait for the callbacks to be called
+
+    let (lock, cvar) = &*cond;
+    let mut count = lock.lock().unwrap();
+    while *count > 0 {
+        count = cvar.wait(count).unwrap();
+    }
+    log::info!("All append operations completed");
 }

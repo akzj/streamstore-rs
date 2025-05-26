@@ -7,7 +7,12 @@ use std::{
     vec,
 };
 
-use crate::{entry::Decoder, error::Error, mem_table::MemTable, segments::Segment};
+use crate::{
+    entry::Decoder,
+    error::Error,
+    mem_table::{GetStreamOffsetFn, MemTable},
+    segments::Segment,
+};
 
 pub fn reload_segments(segment_path: &str) -> Result<Vec<Arc<Segment>>> {
     // Check if the segment path exists
@@ -89,6 +94,7 @@ pub fn reload_wals(
     wal_path: &str,
     last_segment_entry_index: u64,
     max_table_size: u64,
+    get_stream_offset_fn: GetStreamOffsetFn,
 ) -> Result<(Vec<Rc<MemTable>>, File)> {
     // Check if the WAL path exists
     if !std::path::Path::new(wal_path).exists() {
@@ -99,7 +105,7 @@ pub fn reload_wals(
 
     let wals = list_wal_files(wal_path)?;
     let mut entry_index = 0;
-    let mut table = Rc::new(MemTable::new());
+    let mut table = Rc::new(MemTable::new(&get_stream_offset_fn));
     let mut tables = Vec::new();
     // Reload the WAL files
     for (filename, _entry_index) in &wals {
@@ -119,7 +125,7 @@ pub fn reload_wals(
                 );
                 tables.push(table.clone());
                 // create new segment
-                table = Rc::new(MemTable::new());
+                table = Rc::new(MemTable::new(&get_stream_offset_fn));
             }
             entry_index = entry.id;
 
