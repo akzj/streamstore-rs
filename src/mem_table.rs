@@ -63,7 +63,6 @@ impl MemTable {
         let data_len = entry.data.len() as u64;
 
         let mut guard = self.stream_tables.lock().unwrap();
-        let mut offset = 0;
 
         let res = match guard.get_mut(&entry.stream_id) {
             Some(stream_table) => stream_table,
@@ -85,7 +84,7 @@ impl MemTable {
         };
 
         // Append the data to the stream table
-        offset = res.append(&entry.data)?;
+        let offset = res.append(&entry.data)?;
 
         // Update the stream table
         self.size

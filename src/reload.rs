@@ -2,15 +2,12 @@ use anyhow::{Context, Result};
 use std::{
     fs::{File, OpenOptions},
     io::Seek,
+    rc::Rc,
     sync::Arc,
+    vec,
 };
 
-use crate::{
-    entry::Decoder,
-    error::Error,
-    mem_table::MemTable,
-    segments::{Segment, generate_segment},
-};
+use crate::{entry::Decoder, error::Error, mem_table::MemTable, segments::Segment};
 
 pub fn reload_segments(segment_path: &str) -> Result<Vec<Arc<Segment>>> {
     // Check if the segment path exists
@@ -27,19 +24,15 @@ pub fn reload_segments(segment_path: &str) -> Result<Vec<Arc<Segment>>> {
             continue;
         }
         //segment path join file name
-        if let Some(filename) = std::path::Path::new(&segment_path)
-            .join(entry.file_name())
-            .to_str()
-        {
-            // check if file name is valid
-            if !filename.ends_with(".segment") {
-                log::warn!("Invalid segment file name: {}", filename);
-                continue;
-            }
-
-            let segment = Segment::open(filename)?;
-            segment_files.push(std::sync::Arc::new(segment));
+        let filename = std::path::Path::new(&segment_path).join(entry.file_name());
+        // check if file name is valid
+        if !filename.ends_with(".seg") {
+            log::warn!("Invalid segment file name: {:?}", filename);
+            continue;
         }
+
+        let segment = Segment::open(filename)?;
+        segment_files.push(std::sync::Arc::new(segment));
     }
 
     segment_files
@@ -96,7 +89,7 @@ pub fn reload_wals(
     wal_path: &str,
     last_segment_entry_index: u64,
     max_table_size: u64,
-) -> Result<(MemTable, File)> {
+) -> Result<(Vec<Rc<MemTable>>, File)> {
     // Check if the WAL path exists
     if !std::path::Path::new(wal_path).exists() {
         // create the wal path if it does not exist
@@ -106,7 +99,8 @@ pub fn reload_wals(
 
     let wals = list_wal_files(wal_path)?;
     let mut entry_index = 0;
-    let mut table = MemTable::new();
+    let mut table = Rc::new(MemTable::new());
+    let mut tables = Vec::new();
     // Reload the WAL files
     for (filename, _entry_index) in &wals {
         let mut file = File::open(&filename).map_err(Error::new_io_error)?;
@@ -118,16 +112,23 @@ pub fn reload_wals(
             let _ = table.append(&entry).unwrap();
             // check table size > max_table_size
             if table.get_size() > max_table_size {
+                log::info!(
+                    "Table size {} is greater than max table size {}, creating new table",
+                    table.get_size(),
+                    max_table_size
+                );
+                tables.push(table.clone());
                 // create new segment
-                let segment_file_name = format!("{}.segment", table.get_first_entry());
-                generate_segment(&segment_file_name, &table)?;
-                table = MemTable::new();
+                table = Rc::new(MemTable::new());
             }
             entry_index = entry.id;
 
             Ok(true)
         }))?;
     }
+
+    tables.push(table.clone());
+    log::info!("Reloaded {} tables from WAL files", tables.len());
 
     //self.table.lock().unwrap().box
 
@@ -158,5 +159,5 @@ pub fn reload_wals(
 
     // wal.start(wal_inner, sender)?;
 
-    Ok((table, file))
+    Ok((tables, file))
 }

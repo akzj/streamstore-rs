@@ -1,7 +1,12 @@
-use std::sync::{
-    Arc, Mutex,
-    atomic::{self, AtomicU64},
-    mpsc::{Receiver, SyncSender, sync_channel},
+use std::{
+    collections::HashMap,
+    path,
+    rc::Rc,
+    sync::{
+        Arc, Mutex,
+        atomic::{self, AtomicU64},
+        mpsc::{Receiver, SyncSender, sync_channel},
+    },
 };
 
 use anyhow::Result;
@@ -15,6 +20,7 @@ use crate::{
     reader::StreamReader,
     reload::{self, reload_segments},
     segments::{Segment, generate_segment},
+    table,
     wal::Wal,
 };
 
@@ -28,9 +34,10 @@ pub struct StreamStoreInner {
     table: ArcSwap<MemTable>,
     tables: Mutex<Vec<MemTableArc>>,
     segment_files: Mutex<Vec<SegmentArc>>,
+    offsets: Mutex<HashMap<u64, u64>>,
     entry_receiver: Mutex<Receiver<Vec<Entry>>>,
-    write_segment_sender: Arc<SyncSender<(String, MemTableArc)>>,
-    write_segment_receiver: Mutex<Receiver<(String, MemTableArc)>>,
+    write_segment_sender: Arc<SyncSender<(path::PathBuf, MemTableArc)>>,
+    write_segment_receiver: Mutex<Receiver<(path::PathBuf, MemTableArc)>>,
     is_readonly: Arc<atomic::AtomicBool>,
 }
 
@@ -81,7 +88,40 @@ impl Store {
         todo!()
     }
 
-    pub fn get_stream_range(&mut self, stream_id: u64) -> Option<(u64, u64)> {
+    pub fn get_stream_end(&mut self, stream_id: u64) -> Result<u64> {
+        // reverse the order
+        let mut end = match self.table.load().get_stream_range(stream_id) {
+            Some((_begin, end)) => Some(end),
+            None => None,
+        };
+
+        if end.is_none() {
+            end = self.tables.lock().unwrap().iter().find_map(|table| {
+                match table.get_stream_range(stream_id) {
+                    Some((_begin, end)) => return Some(end),
+                    None => return None,
+                }
+            });
+        }
+
+        if end.is_none() {
+            end = self
+                .segment_files
+                .lock()
+                .unwrap()
+                .iter()
+                .find_map(|segment| match segment.get_stream_range(stream_id) {
+                    Some((_begin, end)) => return Some(end),
+                    None => return None,
+                });
+        }
+        if end.is_none() {
+            return Err(Error::new_stream_not_found(stream_id));
+        }
+        return Ok(end.unwrap());
+    }
+
+    pub fn get_stream_begin(&mut self, stream_id: u64) -> Result<u64> {
         let mut begin = self
             .segment_files
             .lock()
@@ -109,43 +149,19 @@ impl Store {
         }
 
         if begin.is_none() {
-            return None;
+            return Err(Error::new_stream_not_found(stream_id));
         }
+        Ok(begin.unwrap())
+    }
 
-        // reverse the order
-        let mut end = match self.table.load().get_stream_range(stream_id) {
-            Some((_begin, end)) => Some(end),
-            None => None,
-        };
-
-        if end.is_none() {
-            end = self.tables.lock().unwrap().iter().find_map(|table| {
-                match table.get_stream_range(stream_id) {
-                    Some((_begin, end)) => return Some(end),
-                    None => return None,
-                }
-            });
+    pub fn get_stream_range(&mut self, stream_id: u64) -> Result<(u64, u64)> {
+        match self.get_stream_begin(stream_id) {
+            Ok(begin) => match self.get_stream_end(stream_id) {
+                Ok(end) => Ok((begin, end)),
+                Err(e) => return Err(e),
+            },
+            Err(e) => Err(e),
         }
-
-        if end.is_none() {
-            end = self
-                .segment_files
-                .lock()
-                .unwrap()
-                .iter()
-                .find_map(|segment| match segment.get_stream_range(stream_id) {
-                    Some((_begin, end)) => return Some(end),
-                    None => return None,
-                });
-        }
-
-        assert!(
-            begin.is_some() && end.is_some(),
-            "Stream range not found for stream_id: {}",
-            stream_id
-        );
-
-        Some((begin.unwrap(), end.unwrap()))
     }
 
     fn get_last_segment_entry_index(&self) -> Result<u64, Error> {
@@ -168,7 +184,7 @@ impl Store {
             let (file_name, table) = write_segment_receiver.recv().unwrap();
             generate_segment(&file_name, &table).unwrap();
             // update segment list
-            let segment = Segment::open(&file_name).unwrap();
+            let segment = Segment::open(file_name).unwrap();
 
             let mut segment_files_guard = self.segment_files.lock().unwrap();
             segment_files_guard.push(Arc::new(segment));
@@ -194,12 +210,15 @@ impl Store {
                 let table = self.table.load();
                 // Append the memory table
                 match table.append(&entry) {
-                    Ok(offset) => match entry.callback {
-                        Some(callback) => {
-                            callback(Ok(offset));
+                    Ok(offset) => {
+                        self.offsets.lock().unwrap().insert(entry.stream_id, offset);
+                        match entry.callback {
+                            Some(callback) => {
+                                callback(Ok(offset));
+                            }
+                            None => {}
                         }
-                        None => {}
-                    },
+                    }
                     Err(e) => {
                         log::error!("Failed to append entry: {:?}", e);
                         return;
@@ -211,10 +230,10 @@ impl Store {
                     self.tables.lock().unwrap().push(table.clone());
                     self.table.store(Arc::new(MemTable::new()));
                     let filename = std::path::Path::new(&self.config.segment_path)
-                        .join(format!("{}.segment", table.get_first_entry()));
+                        .join(format!("{}.seg", table.get_first_entry()));
                     // notify to create a new segment
                     self.write_segment_sender
-                        .send((filename.to_str().unwrap().to_string(), table.clone()))
+                        .send((filename, table.clone()))
                         .unwrap();
                     // Reset the memory table
                 }
@@ -226,20 +245,31 @@ impl Store {
         let (entries_sender, entries_receiver) = sync_channel::<Vec<Entry>>(100);
 
         let mut last_segment_entry_index = 0;
-        let segment_files = reload_segments(&config.segment_path)?;
+        let mut segment_files = reload_segments(&config.segment_path)?;
         if !segment_files.is_empty() {
             last_segment_entry_index = segment_files.last().unwrap().entry_index().1;
         }
 
-        let (memtable, file) = reload::reload_wals(
+        let (mut memtables, file) = reload::reload_wals(
             &config.wal_path,
             last_segment_entry_index,
             config.max_table_size,
         )?;
+        let memtable = memtables.pop().unwrap();
+
+        // generate the segment files from the memtable
+        for table in memtables {
+            let filename = std::path::Path::new(&config.segment_path)
+                .join(format!("{}.seg", table.get_first_entry()));
+
+            generate_segment(&filename, &table)?;
+            let segment = Segment::open(filename)?;
+            segment_files.push(Arc::new(segment));
+        }
 
         let is_readonly = Arc::new(atomic::AtomicBool::new(false));
-
         let last_log_entry = memtable.get_last_entry();
+
         let wal = Wal::new(
             file,
             config.wal_path.clone(),
@@ -260,7 +290,10 @@ impl Store {
         log::info!("last log entry: {}", last_log_entry);
 
         let (write_segment_sender, write_segment_receiver) =
-            sync_channel::<(String, MemTableArc)>(10);
+            sync_channel::<(path::PathBuf, MemTableArc)>(10);
+
+        // unwrap the Rc to get the inner memtable
+        let memtable = Rc::into_inner(memtable).unwrap();
 
         let storeinner = StreamStoreInner {
             wal: wal,
@@ -272,6 +305,7 @@ impl Store {
             entry_receiver: Mutex::new(entries_receiver),
             write_segment_sender: Arc::new(write_segment_sender),
             write_segment_receiver: Mutex::new(write_segment_receiver),
+            offsets: Mutex::new(HashMap::new()),
             is_readonly: is_readonly.clone(),
         };
 

@@ -1,6 +1,10 @@
 use crate::{error::Error, mem_table::MemTable};
-use anyhow::Result;
-use std::{fs::File, io::Write};
+use anyhow::{Context, Result};
+use std::{
+    fs::File,
+    io::Write,
+    path::{self, Path, PathBuf},
+};
 
 const SEGMENT_STREAM_HEADER_SIZE: u64 = std::mem::size_of::<SegmentStreamHeader>() as u64;
 const SEGMENT_HEADER_SIZE: u64 = std::mem::size_of::<SegmentHeader>() as u64;
@@ -35,12 +39,12 @@ pub struct SegmentHeader {
 
 pub struct Segment {
     file: File,
-    pub file_name: String,
+    pub file_name: path::PathBuf,
     data: memmap2::Mmap,
 }
 
 impl Segment {
-    pub fn new(file: File, file_name: String, data: memmap2::Mmap) -> Self {
+    pub fn new(file: File, file_name: path::PathBuf, data: memmap2::Mmap) -> Self {
         Segment {
             file,
             data,
@@ -48,13 +52,13 @@ impl Segment {
         }
     }
 
-    pub fn open(file_name: &str) -> Result<Segment, Error> {
-        let file = File::open(file_name).map_err(Error::new_io_error)?;
+    pub fn open(file_name: path::PathBuf) -> Result<Segment, Error> {
+        let file = File::open(&file_name).map_err(Error::new_io_error)?;
         let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(Error::new_io_error)?;
         let segment = Segment {
             file,
-            file_name: file_name.to_string(),
             data: mmap,
+            file_name: file_name,
         };
         Ok(segment)
     }
@@ -64,8 +68,8 @@ impl Segment {
         (header.first_entry, header.last_entry)
     }
 
-    pub fn file_name(&self) -> &str {
-        &self.file_name
+    pub fn file_name(&self) -> path::PathBuf {
+        self.file_name.clone()
     }
 
     pub fn read_header(&self) -> SegmentHeader {
@@ -122,22 +126,23 @@ impl Segment {
     }
 }
 
-pub fn generate_segment(filename: &str, table: &MemTable) -> Result<Segment, Error> {
+pub fn generate_segment<P: AsRef<Path>>(segment_file_path: P, table: &MemTable) -> Result<Segment> {
     assert!(align_of::<SegmentHeader>() <= 8);
 
-    let temp_filename = format!("{}.tmp", filename);
-    let mut file = File::create(&temp_filename).map_err(Error::new_io_error)?;
+    let temp_file_path = segment_file_path.as_ref().with_extension("tmp");
+
+    let mut file = File::create(&temp_file_path).map_err(Error::new_io_error)?;
 
     let mut segment_stream_headers = Vec::new();
 
     // delete temp file if errors happen
-    let temp_filename_clone = temp_filename.clone();
+    let temp_filename_clone = temp_file_path.clone();
     defer::defer!({
         // check if the file exists
         if std::fs::metadata(&temp_filename_clone).is_ok() {
             // delete the file
             if std::fs::remove_file(&temp_filename_clone).is_err() {
-                log::warn!("Failed to delete temp file: {}", &temp_filename_clone);
+                log::warn!("Failed to delete temp file: {:?}", &temp_filename_clone);
             }
         }
     });
@@ -214,15 +219,15 @@ pub fn generate_segment(filename: &str, table: &MemTable) -> Result<Segment, Err
     drop(file);
 
     // rename the file
-    std::fs::rename(temp_filename, filename).map_err(Error::new_io_error)?;
+    std::fs::rename(temp_file_path, &segment_file_path).map_err(Error::new_io_error)?;
 
     // open file with read only
-    let file = File::open(filename).map_err(Error::new_io_error)?;
+    let file = File::open(&segment_file_path).map_err(Error::new_io_error)?;
 
     let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(Error::new_io_error)?;
     let segment = Segment {
         file,
-        file_name: filename.to_string(),
+        file_name: segment_file_path.as_ref().to_path_buf(),
         data: mmap,
     };
 
