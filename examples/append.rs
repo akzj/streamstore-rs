@@ -1,6 +1,7 @@
 use std::io::Write;
+use std::sync::{Arc, Condvar, Mutex};
 use std::{thread::sleep, time::Duration};
-
+use streamstore::entry::AppendEntryCallback;
 fn main() {
     // Initialize the logger
     // env_logger::init();
@@ -30,10 +31,35 @@ fn main() {
         }
     };
 
-    store.append(1, "hello world".into(), None).unwrap();
-    store.append(1, "hello world".into(), None).unwrap();
-    store.append(1, "hello world".into(), None).unwrap();
-    store.append(1, "hello world".into(), None).unwrap();
+    let cond = Arc::new((Mutex::new(0 as u64), Condvar::new()));
+
+    let make_callback = |cond: Arc<(Mutex<u64>, Condvar)>| {
+        Some(Box::new(move |result| match result {
+            Ok(entry) => {
+                log::info!("Append success: {:?}", entry);
+                let (lock, cvar) = &*cond;
+                let mut count = lock.lock().unwrap();
+                *count += 1;
+                cvar.notify_all();
+            }
+            Err(e) => {
+                log::error!("Append failed: {:?}", e);
+            }
+        }) as AppendEntryCallback)
+    };
+
+    store
+        .append(1, "hello world".into(), make_callback(cond.clone()))
+        .unwrap();
+    store
+        .append(1, "hello world".into(), make_callback(cond.clone()))
+        .unwrap();
+    store
+        .append(1, "hello world".into(), make_callback(cond.clone()))
+        .unwrap();
+    store
+        .append(1, "hello world".into(), make_callback(cond.clone()))
+        .unwrap();
 
     sleep(Duration::from_secs(3));
 }

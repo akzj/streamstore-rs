@@ -1,4 +1,4 @@
-mod entry;
+pub mod entry;
 mod error;
 mod mem_table;
 pub mod options;

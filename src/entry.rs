@@ -8,7 +8,7 @@ use anyhow::anyhow;
 use crate::error::Error;
 use anyhow::{Context, Result};
 
-pub type AppendEntryCallback = dyn Fn(Result<u64, Error>) -> () + Send + Sync;
+pub type AppendEntryCallback = Box<dyn Fn(Result<u64>) -> () + Send + Sync>;
 pub type DataType = Vec<u8>;
 
 pub struct Entry {
@@ -17,7 +17,7 @@ pub struct Entry {
     pub id: u64,
     pub stream_id: u64,
     pub data: DataType,
-    pub callback: Option<Box<AppendEntryCallback>>,
+    pub callback: Option<AppendEntryCallback>,
 }
 
 pub trait Encoder {
@@ -127,11 +127,12 @@ fn test_entry_encode() {
         data: "hello world".as_bytes().to_vec(),
         callback: None,
     };
+
     let encoded = entry.encode();
 
     // write the encoded data to a file
     let mut file = File::create("test_entry.bin").expect("Failed to create file");
-    file.write_all(&encoded).expect("Failed to write to file");
+    file.write(&encoded).expect("Failed to write to file");
 
     file.sync_all().expect("Failed to flush file");
     drop(file);

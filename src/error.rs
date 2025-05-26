@@ -1,9 +1,9 @@
+use std::any;
+
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum Error {
-    #[error("Stream not found")]
-    NotFound,
     #[error("Stream already exists")]
     AlreadyExists,
     #[error("invalid data")]
@@ -16,27 +16,19 @@ pub enum Error {
     WalChannelSendError,
     #[error("IO error")]
     IoError(std::io::Error),
-    #[error("Stream offset is invalid")]
-    StreamOffsetInvalid,
-    #[error("Stream Not Found")]
-    StreamNotFound,
+    #[error("Stream {stream_id} offset {offset} is invalid")]
+    StreamOffsetInvalid { stream_id: u64, offset: u64 },
+    #[error("Stream {stream_id} Not Found")]
+    StreamNotFound { stream_id: u64 },
 }
 
 impl Error {
-    pub fn is_not_found(&self) -> bool {
-        matches!(self, Error::NotFound)
+    pub fn new_stream_offset_invalid(stream_id: u64, offset: u64) -> anyhow::Error {
+        anyhow::anyhow!(Error::StreamOffsetInvalid { stream_id, offset })
     }
 
-    pub fn is_already_exists(&self) -> bool {
-        matches!(self, Error::AlreadyExists)
-    }
-
-    pub fn is_invalid_data(&self) -> bool {
-        matches!(self, Error::InvalidData)
-    }
-
-    pub fn is_internal_error(&self) -> bool {
-        matches!(self, Error::InternalError)
+    pub fn new_stream_not_found(stream_id: u64) -> anyhow::Error {
+        anyhow::anyhow!(Error::StreamNotFound { stream_id })
     }
 
     pub fn new_wal_channel_send_error() -> Self {

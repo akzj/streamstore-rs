@@ -49,7 +49,7 @@ impl Store {
         &self,
         stream_id: u64,
         data: DataType,
-        callback: Option<Box<AppendEntryCallback>>,
+        callback: Option<AppendEntryCallback>,
     ) -> Result<()> {
         let id = self
             .entry_index
@@ -64,24 +64,17 @@ impl Store {
         })
     }
 
-    pub fn read(&mut self, stream_id: u64, offset: u64, size: u64) -> Result<DataType, Error> {
+    pub fn read(&mut self, stream_id: u64, offset: u64, size: u64) -> Result<DataType> {
         let table = self.table.load();
-        let stream_range = table.get_stream_range(stream_id);
-        if let Some((_start, end)) = stream_range {
-            if offset > end {
-                return Err(Error::new_io_error(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "Offset out of range",
-                )));
+        match table.get_stream_range(stream_id) {
+            Some((start, end)) => {
+                if offset < start || offset + size > end {
+                    return Err(Error::new_stream_offset_invalid(stream_id, offset));
+                }
+                return table.read_stream_data(stream_id, offset, size);
             }
-            let data = table.read_stream_data(stream_id, offset, size)?;
-            return Ok(data);
+            None => Err(Error::new_stream_not_found(stream_id)),
         }
-
-        Err(Error::new_io_error(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "Stream not found",
-        )))
     }
 
     fn get_reader(&mut self, stream_id: u64) -> Result<Box<dyn StreamReader>, Error> {
@@ -200,7 +193,18 @@ impl Store {
             for entry in entries.unwrap() {
                 let table = self.table.load();
                 // Append the memory table
-                table.append(&entry).unwrap();
+                match table.append(&entry) {
+                    Ok(offset) => match entry.callback {
+                        Some(callback) => {
+                            callback(Ok(offset));
+                        }
+                        None => {}
+                    },
+                    Err(e) => {
+                        log::error!("Failed to append entry: {:?}", e);
+                        return;
+                    }
+                }
 
                 // Check if the table size is greater than the max size
                 if table.get_size() > self.config.max_table_size {
@@ -216,23 +220,6 @@ impl Store {
                 }
             }
         }
-    }
-
-    fn start(&self) -> () {
-        self.wal.start();
-
-        let _self = self.clone();
-        let _ = std::thread::Builder::new()
-            .name("store::run".to_string())
-            .spawn(move || {
-                _self.run();
-            });
-        let _self = self.clone();
-        let _ = std::thread::Builder::new()
-            .name("run_segment_generater".to_string())
-            .spawn(move || {
-                _self.run_segment_generater().unwrap();
-            });
     }
 
     pub fn reload(config: &Options) -> Result<Self> {
@@ -295,5 +282,22 @@ impl Store {
         store.start();
 
         Ok(store)
+    }
+
+    fn start(&self) -> () {
+        self.wal.start();
+
+        let _self = self.clone();
+        let _ = std::thread::Builder::new()
+            .name("store::run".to_string())
+            .spawn(move || {
+                _self.run();
+            });
+        let _self = self.clone();
+        let _ = std::thread::Builder::new()
+            .name("run_segment_generater".to_string())
+            .spawn(move || {
+                _self.run_segment_generater().unwrap();
+            });
     }
 }

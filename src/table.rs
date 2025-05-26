@@ -28,7 +28,7 @@ impl StreamData {
     // Fill the buffer with data
     // If the buffer is full, return the remaining data
     // If the buffer is not full, return None
-    pub fn fill<'a>(&mut self, data: &'a [u8]) -> Result<(u64, Option<&'a [u8]>), Error> {
+    pub fn fill<'a>(&mut self, data: &'a [u8]) -> Result<(u64, Option<&'a [u8]>)> {
         let available = self.cap_remaining().min(data.len() as u64);
         self.data.extend_from_slice(&data[..available as usize]);
 
@@ -73,7 +73,7 @@ impl StreamTable {
         }
     }
 
-    pub fn append(&mut self, data: &[u8]) -> Result<(), Error> {
+    pub fn append(&mut self, data: &[u8]) -> Result<u64> {
         if self.stream_datas.is_empty() || self.stream_datas.last().unwrap().cap_remaining() == 0 {
             self.stream_datas.push(StreamData::new(
                 self.stream_id,
@@ -91,7 +91,7 @@ impl StreamTable {
             return self.append(buffer);
         }
 
-        Ok(())
+        Ok(self.offset + self.size)
     }
 
     pub fn get_stream_range(&self) -> Option<(u64, u64)> {
@@ -101,7 +101,7 @@ impl StreamTable {
         return Some((self.offset, self.offset + self.size));
     }
 
-    pub fn read_stream_data(&self, offset: u64, size: u64) -> Result<Vec<u8>, Error> {
+    pub fn read_stream_data(&self, offset: u64, size: u64) -> Result<Vec<u8>> {
         let mut data = Vec::new();
         let mut offset = offset;
         let mut size = size;

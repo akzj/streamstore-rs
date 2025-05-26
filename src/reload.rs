@@ -115,8 +115,7 @@ pub fn reload_wals(
             if entry.id < last_segment_entry_index {
                 return Ok(true);
             }
-            table.append(&entry)?;
-
+            let _ = table.append(&entry).unwrap();
             // check table size > max_table_size
             if table.get_size() > max_table_size {
                 // create new segment
