@@ -31,7 +31,7 @@ pub struct StreamStoreInner {
     entry_receiver: Mutex<Receiver<Vec<Entry>>>,
     write_segment_sender: Arc<SyncSender<(String, MemTableArc)>>,
     write_segment_receiver: Mutex<Receiver<(String, MemTableArc)>>,
-    is_stop: atomic::AtomicBool,
+    is_readonly: Arc<atomic::AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -166,7 +166,7 @@ impl Store {
 
     fn run_segment_generater(&self) -> Result<(), Error> {
         loop {
-            if self.is_stop.load(atomic::Ordering::SeqCst) {
+            if self.is_readonly.load(atomic::Ordering::SeqCst) {
                 log::info!("Stop segment generator");
                 break;
             }
@@ -250,6 +250,8 @@ impl Store {
             config.max_table_size,
         )?;
 
+        let is_readonly = Arc::new(atomic::AtomicBool::new(false));
+
         let last_log_entry = memtable.get_last_entry();
         let wal = Wal::new(
             file,
@@ -257,10 +259,15 @@ impl Store {
             config.max_wal_size,
             last_log_entry,
             entries_sender,
-            Box::new(|err| {
-                // handle error
-                println!("Error: {}", err);
-            }),
+            {
+                let is_readonly = is_readonly.clone();
+                Box::new(move |err| {
+                    // handle error
+                    log::error!("WAL error: {}", err);
+                    // stop the store
+                    is_readonly.store(true, atomic::Ordering::SeqCst);
+                })
+            },
         );
 
         log::info!("last log entry: {}", last_log_entry);
@@ -278,7 +285,7 @@ impl Store {
             entry_receiver: Mutex::new(entries_receiver),
             write_segment_sender: Arc::new(write_segment_sender),
             write_segment_receiver: Mutex::new(write_segment_receiver),
-            is_stop: atomic::AtomicBool::new(false),
+            is_readonly: is_readonly.clone(),
         };
 
         // reload the segments
