@@ -1,4 +1,3 @@
-
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -17,6 +16,9 @@ pub enum Error {
 
     #[error("is closed")]
     CloseError,
+
+    #[error("store is read-only")]
+    StoreIsReadOnly,
 
     #[error("channel is closed")]
     WalChannelSendError,
@@ -49,4 +51,8 @@ pub fn new_invalid_path(path: std::path::PathBuf) -> anyhow::Error {
 
 pub fn new_invalid_data() -> anyhow::Error {
     anyhow::anyhow!(Error::InvalidData)
+}
+
+pub fn new_store_is_read_only() -> anyhow::Error {
+    anyhow::anyhow!(Error::StoreIsReadOnly)
 }

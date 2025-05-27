@@ -14,7 +14,7 @@ use arc_swap::ArcSwap;
 
 use crate::{
     entry::{AppendEntryResultFn, DataType, Entry},
-    errors::{Error, new_stream_not_found, new_stream_offset_invalid},
+    errors::{self, Error, new_stream_not_found, new_stream_offset_invalid},
     mem_table::{GetStreamOffsetFn, MemTable, MemTableArc},
     options::Options,
     reader::StreamReader,
@@ -57,6 +57,10 @@ impl Store {
         data: DataType,
         callback: Option<AppendEntryResultFn>,
     ) -> Result<()> {
+        // Check if the store is read-only
+        if self.is_readonly.load(atomic::Ordering::SeqCst) {
+            return Err(errors::new_store_is_read_only());
+        }
         let id = self
             .entry_index
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -181,9 +185,10 @@ impl Store {
                 let offset = stream_header.offset + stream_header.size;
                 self.offsets.lock().unwrap().insert(stream_id, offset);
                 log::info!(
-                    "Reloaded stream {} with offset {} from segment ",
+                    "Reloaded stream {} with offset {} from segment {} ",
                     stream_id,
-                    offset
+                    offset,
+                    segment.filename().display()
                 );
             }
         }
@@ -237,7 +242,35 @@ impl Store {
 
             let write_segment_receiver = self.write_segment_receiver.lock().unwrap();
             let (file_name, table) = write_segment_receiver.recv().unwrap();
-            generate_segment(&file_name, &table).unwrap();
+            match generate_segment(&file_name, &table) {
+                Ok(_) => {
+                    log::info!("Segment generated: {}", file_name.display());
+                    match self.wal.gc(table.get_last_entry()) {
+                        Ok(_) => {
+                            log::info!(
+                                "WAL garbage collection completed for segment: {}",
+                                file_name.display()
+                            );
+                        }
+                        Err(e) => {
+                            log::error!("Failed to garbage collect WAL: {:?}", e);
+                            // If WAL garbage collection fails, set the store to readonly
+                            self.is_readonly.store(true, atomic::Ordering::SeqCst);
+                            return Err(e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    // If segment generation fails, set the store to readonly
+                    self.is_readonly.store(true, atomic::Ordering::SeqCst);
+                    log::error!(
+                        "Failed to generate segment {}: {:?}",
+                        file_name.display(),
+                        e
+                    );
+                    return Err(e);
+                }
+            }
             // update segment list
             let segment = Segment::open(file_name).unwrap();
 
@@ -325,7 +358,7 @@ impl Store {
             last_segment_entry_index = segment_files.last().unwrap().entry_index().1;
         }
 
-        let (mut memtables, file) = reload::reload_wals(
+        let (mut memtables, files, file) = reload::reload_wals(
             &config.wal_path,
             last_segment_entry_index,
             config.max_table_size,
@@ -352,6 +385,7 @@ impl Store {
             config.max_wal_size,
             last_log_entry,
             entries_sender,
+            files,
             {
                 let is_readonly = is_readonly.clone();
                 Box::new(move |err| {

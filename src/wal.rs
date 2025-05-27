@@ -5,8 +5,10 @@ use crate::{
 use anyhow::{Context, Error, Result};
 
 use std::{
+    collections::HashMap,
     fs::File,
     io::Write,
+    path::PathBuf,
     sync::{
         Arc, Mutex, atomic,
         mpsc::{Receiver, SyncSender},
@@ -23,6 +25,7 @@ pub struct WalInner {
     sender: SyncSender<Entry>,
     next: SyncSender<Vec<Entry>>,
     receiver: Mutex<Receiver<Entry>>,
+    wal_files: Mutex<HashMap<u64, PathBuf>>,
     err_handler: std::sync::Mutex<Box<dyn Fn(anyhow::Error) + Send + Sync>>,
 }
 
@@ -160,23 +163,45 @@ impl Wal {
         max_size: u64,
         last_entry: u64,
         next: SyncSender<Vec<Entry>>,
+        wal_files: HashMap<u64, PathBuf>,
         err_handler: Box<dyn Fn(Error) + Send + Sync>,
     ) -> Self {
         let (sender, receiver) = std::sync::mpsc::sync_channel(1024);
-
         let file_size = file.metadata().expect("Failed to get file metadata").len();
-
         Wal(Arc::new(WalInner {
             dir,
             next,
             sender,
             max_size,
+            wal_files: Mutex::new(wal_files),
             file: Mutex::new(file),
             receiver: Mutex::new(receiver),
             last_entry: atomic::AtomicU64::new(last_entry),
             file_size: atomic::AtomicU64::new(file_size),
             err_handler: std::sync::Mutex::new(err_handler),
         }))
+    }
+
+    pub fn gc(&self, last_entry_id: u64) -> Result<()> {
+        // Perform garbage collection on the WAL files
+        let mut to_removes = vec![];
+        let mut wal_files = self.wal_files.lock().unwrap();
+        for (id, path) in wal_files.iter() {
+            if *id <= last_entry_id {
+                // Remove files that are no longer needed
+                if let Err(e) = std::fs::remove_file(path) {
+                    return Err(errors::new_io_error(e)
+                        .context(format!("Failed to remove WAL file: {}", path.display())));
+                } else {
+                    log::info!("Removed WAL file: {}, last_entry_id {}", path.display(), id);
+                }
+                to_removes.push(*id);
+            }
+        }
+        for id in to_removes {
+            wal_files.remove(&id);
+        }
+        Ok(())
     }
 
     pub fn write(&self, item: Entry) -> Result<()> {

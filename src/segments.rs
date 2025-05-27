@@ -39,7 +39,7 @@ pub struct SegmentHeader {
 
 pub struct Segment {
     file: File,
-    pub file_name: path::PathBuf,
+    pub filename: path::PathBuf,
     data: memmap2::Mmap,
 }
 
@@ -48,7 +48,7 @@ impl Segment {
         Segment {
             file,
             data,
-            file_name,
+            filename: file_name,
         }
     }
 
@@ -58,7 +58,7 @@ impl Segment {
         let segment = Segment {
             file,
             data: mmap,
-            file_name: file_name,
+            filename: file_name,
         };
         Ok(segment)
     }
@@ -68,8 +68,8 @@ impl Segment {
         (header.first_entry, header.last_entry)
     }
 
-    pub fn file_name(&self) -> path::PathBuf {
-        self.file_name.clone()
+    pub fn filename(&self) -> path::PathBuf {
+        self.filename.clone()
     }
 
     pub fn read_header(&self) -> SegmentHeader {
@@ -227,7 +227,7 @@ pub fn generate_segment<P: AsRef<Path>>(segment_file_path: P, table: &MemTable) 
     let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(errors::new_io_error)?;
     let segment = Segment {
         file,
-        file_name: segment_file_path.as_ref().to_path_buf(),
+        filename: segment_file_path.as_ref().to_path_buf(),
         data: mmap,
     };
 

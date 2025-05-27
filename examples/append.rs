@@ -29,6 +29,7 @@ fn main() {
 
     let mut options = streamstore::options::Options::default();
     options.max_wal_size(1024);
+    options.max_table_size(3000);
 
     println!("options {:?}", &options);
 

@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
 use std::{
+    collections::HashMap,
     fs::{File, OpenOptions},
     io::Seek,
+    path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
     vec,
@@ -31,7 +33,7 @@ pub fn reload_segments(segment_path: &str) -> Result<Vec<Arc<Segment>>> {
         //segment path join file name
         let filename = std::path::Path::new(&segment_path).join(entry.file_name());
         // check if file name is valid
-        if !filename.ends_with(".seg") {
+        if !filename.extension().map_or(false, |ext| ext == "seg") {
             log::warn!("Invalid segment file name: {:?}", filename);
             continue;
         }
@@ -105,7 +107,7 @@ pub fn reload_wals(
     last_segment_entry_index: u64,
     max_table_size: u64,
     get_stream_offset_fn: GetStreamOffsetFn,
-) -> Result<(Vec<Rc<MemTable>>, File)> {
+) -> Result<(Vec<Rc<MemTable>>, HashMap<u64, PathBuf>, File)> {
     // Check if the WAL path exists
     if !std::path::Path::new(wal_path).exists() {
         // create the wal path if it does not exist
@@ -114,6 +116,7 @@ pub fn reload_wals(
     }
 
     let wals = list_wal_files(wal_path)?;
+    let mut files = HashMap::new();
     let mut entry_index = 0;
     let mut table = Rc::new(MemTable::new(&get_stream_offset_fn));
     let mut tables = Vec::new();
@@ -142,12 +145,25 @@ pub fn reload_wals(
                 table = Rc::new(MemTable::new(&get_stream_offset_fn));
             }
             entry_index = entry.id;
-
             Ok(true)
         }))?;
 
+        if entry_index < last_segment_entry_index {
+            log::info!(
+                "WAL file {} all entries before the last segment entry index {}. delete it.",
+                filename,
+                last_segment_entry_index
+            );
+            std::fs::remove_file(filename).context("Failed to remove WAL file")?;
+            log::info!("Deleted WAL file: {} success", filename);
+            continue;
+        }
+        files.insert(entry_index, PathBuf::from(filename).to_path_buf());
         log::debug!("Reloaded {} entries from WAL file: {}", count, filename);
     }
+
+    // remove the last entry index from files
+    files.remove(&entry_index);
 
     tables.push(table.clone());
     log::info!("Reloaded {} tables from WAL files", tables.len());
@@ -171,5 +187,5 @@ pub fn reload_wals(
     file.seek(std::io::SeekFrom::End(0))
         .map_err(errors::new_io_error)?;
 
-    Ok((tables, file))
+    Ok((tables, files, file))
 }
