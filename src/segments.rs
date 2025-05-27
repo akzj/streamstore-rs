@@ -1,9 +1,9 @@
 use crate::{errors, mem_table::MemTable};
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::{
     fs::File,
     io::Write,
-    path::{self, Path, PathBuf},
+    path::{self, Path},
 };
 
 const SEGMENT_STREAM_HEADER_SIZE: u64 = std::mem::size_of::<SegmentStreamHeader>() as u64;

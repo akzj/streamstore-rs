@@ -1,4 +1,3 @@
-use core::error;
 use std::{
     fs::File,
     io::{Read, Write},

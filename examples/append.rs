@@ -1,7 +1,6 @@
 use std::env;
 use std::io::Write;
 use std::sync::{Arc, Condvar, Mutex};
-use std::{thread::sleep, time::Duration};
 use streamstore::entry::AppendEntryResultFn;
 fn main() {
     // Initialize the logger

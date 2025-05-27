@@ -2,7 +2,6 @@ use anyhow::{Context, Result};
 use std::{
     fs::{File, OpenOptions},
     io::Seek,
-    os,
     rc::Rc,
     sync::Arc,
     vec,
@@ -87,7 +86,7 @@ fn list_wal_files(wal_path: &str) -> Result<Vec<(String, u64)>> {
             // Decode the entries from the WAL file
             file.decode(Box::new(|entry| {
                 // Handle the entry
-                log::info!("decode {} first entry id {}", filename, entry.id);
+                log::debug!("decode {} first entry id {}", filename, entry.id);
                 entry_index = entry.id;
                 Ok(false)
             }))?;
@@ -97,7 +96,7 @@ fn list_wal_files(wal_path: &str) -> Result<Vec<(String, u64)>> {
     }
     wals.sort_by(|a, b| a.1.cmp(&b.1));
 
-    log::info!("list wals success,files {:?}", wals);
+    log::debug!("list wals success,files {:?}", wals);
     Ok(wals)
 }
 
@@ -120,9 +119,12 @@ pub fn reload_wals(
     let mut tables = Vec::new();
     // Reload the WAL files
     for (filename, _entry_index) in &wals {
-        log::info!("Reloading WAL file: {}", filename);
+        log::debug!("Reloading WAL file: {}", filename);
         let mut file = File::open(&filename).map_err(errors::new_io_error)?;
+        let mut count = 0;
+
         file.decode(Box::new(|entry| {
+            count += 1;
             // Handle the entry
             if entry.id < last_segment_entry_index {
                 return Ok(true);
@@ -143,6 +145,8 @@ pub fn reload_wals(
 
             Ok(true)
         }))?;
+
+        log::debug!("Reloaded {} entries from WAL file: {}", count, filename);
     }
 
     tables.push(table.clone());

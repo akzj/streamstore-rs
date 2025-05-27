@@ -20,7 +20,6 @@ use crate::{
     reader::StreamReader,
     reload::{self, reload_segments},
     segments::{Segment, generate_segment},
-    table,
     wal::Wal,
 };
 
