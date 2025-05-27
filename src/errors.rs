@@ -32,23 +32,22 @@ pub enum Error {
     StreamNotFound { stream_id: u64 },
 }
 
-impl Error {
-    pub fn new_stream_offset_invalid(stream_id: u64, offset: u64) -> anyhow::Error {
-        anyhow::anyhow!(Error::StreamOffsetInvalid { stream_id, offset })
-    }
+pub fn new_stream_offset_invalid(stream_id: u64, offset: u64) -> anyhow::Error {
+    anyhow::anyhow!(Error::StreamOffsetInvalid { stream_id, offset })
+}
 
-    pub fn new_stream_not_found(stream_id: u64) -> anyhow::Error {
-        anyhow::anyhow!(Error::StreamNotFound { stream_id })
-    }
+pub fn new_stream_not_found(stream_id: u64) -> anyhow::Error {
+    anyhow::anyhow!(Error::StreamNotFound { stream_id })
+}
 
-    pub fn new_wal_channel_send_error() -> Self {
-        Error::WalChannelSendError
-    }
-    pub fn new_io_error(e: std::io::Error) -> Self {
-        Error::IoError(e)
-    }
+pub fn new_io_error(e: std::io::Error) -> anyhow::Error {
+    anyhow::anyhow!(Error::IoError(e))
+}
 
-    pub fn new_invalid_path(path: std::path::PathBuf) -> anyhow::Error {
-        anyhow::anyhow!(Error::InValidPath { path })
-    }
+pub fn new_invalid_path(path: std::path::PathBuf) -> anyhow::Error {
+    anyhow::anyhow!(Error::InValidPath { path })
+}
+
+pub fn new_invalid_data() -> anyhow::Error {
+    anyhow::anyhow!(Error::InvalidData)
 }

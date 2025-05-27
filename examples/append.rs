@@ -1,3 +1,4 @@
+use std::env;
 use std::io::Write;
 use std::sync::{Arc, Condvar, Mutex};
 use std::{thread::sleep, time::Duration};
@@ -5,6 +6,14 @@ use streamstore::entry::AppendEntryResultFn;
 fn main() {
     // Initialize the logger
     // env_logger::init();
+
+    // set rust_log to use the environment variable RUST_LOG
+    let log_level = "RUST_LOG";
+    let env = env::var(log_level).unwrap_or_else(|_| "debug".to_string());
+    unsafe {
+        env::set_var(log_level, env);
+    }
+
     env_logger::Builder::from_default_env()
         .format(|buf, record| {
             writeln!(
@@ -19,7 +28,8 @@ fn main() {
         .init();
     log::info!("Starting streamstore example");
 
-    let options = streamstore::options::Options::default();
+    let mut options = streamstore::options::Options::default();
+    options.max_wal_size(1024);
 
     println!("options {:?}", &options);
 
@@ -54,18 +64,13 @@ fn main() {
         }) as AppendEntryResultFn)
     };
 
-    store
-        .append(1, "hello world".into(), make_callback(cond.clone()))
-        .unwrap();
-    store
-        .append(1, "hello world".into(), make_callback(cond.clone()))
-        .unwrap();
-    store
-        .append(1, "hello world".into(), make_callback(cond.clone()))
-        .unwrap();
-    store
-        .append(1, "hello world".into(), make_callback(cond.clone()))
-        .unwrap();
+    for i in 0..1 {
+        let data = format!("hello world {}", i);
+        log::info!("Appending entry: {}", data);
+        store
+            .append(1, data.into(), make_callback(cond.clone()))
+            .unwrap();
+    }
 
     // Wait for the callbacks to be called
 
@@ -75,4 +80,21 @@ fn main() {
         count = cvar.wait(count).unwrap();
     }
     log::info!("All append operations completed");
+
+    let begin = store.get_stream_begin(1).unwrap();
+    log::info!("Stream begin: {:?}", begin);
+
+    let end = store.get_stream_end(1).unwrap();
+    log::info!("Stream end: {:?}", end);
+
+    let res = store.read(1, 0, end);
+    match res {
+        Ok(data) => {
+            // vec to string
+            log::info!("Read entries: {}", String::from_utf8(data).unwrap().len());
+        }
+        Err(e) => {
+            log::error!("Failed to read entries: {:?}", e);
+        }
+    }
 }

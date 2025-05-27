@@ -1,11 +1,12 @@
+use core::error;
 use std::{
     fs::File,
     io::{Read, Write},
 };
 
-use anyhow::anyhow;
+use anyhow::{Error, anyhow};
 
-use crate::error::Error;
+use crate::errors;
 use anyhow::{Context, Result};
 
 pub type AppendEntryResultFn = Box<dyn Fn(Result<u64>) -> () + Send + Sync>;
@@ -81,10 +82,10 @@ impl<'a> Decoder<'a> for File {
 
                 entry.data.resize(data_size as usize, 0);
                 self.read_exact(&mut entry.data)
-                    .map_err(Error::new_io_error)?;
+                    .map_err(errors::new_io_error)?;
             } else {
                 log::error!("Unsupported version: {}", entry.version);
-                return Err(anyhow!(Error::InvalidData));
+                return Err(anyhow!(errors::new_invalid_data()));
             }
             // Call the closure with the decoded entry
             if !closure(entry)? {

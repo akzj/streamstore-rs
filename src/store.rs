@@ -14,7 +14,7 @@ use arc_swap::ArcSwap;
 
 use crate::{
     entry::{AppendEntryResultFn, DataType, Entry},
-    error::Error,
+    errors::{Error, new_stream_not_found, new_stream_offset_invalid},
     mem_table::{GetStreamOffsetFn, MemTable, MemTableArc},
     options::Options,
     reader::StreamReader,
@@ -71,16 +71,16 @@ impl Store {
         })
     }
 
-    pub fn read(&mut self, stream_id: u64, offset: u64, size: u64) -> Result<DataType> {
+    pub fn read(&self, stream_id: u64, offset: u64, size: u64) -> Result<DataType> {
         let table = self.table.load();
         match table.get_stream_range(stream_id) {
             Some((start, end)) => {
                 if offset < start || offset + size > end {
-                    return Err(Error::new_stream_offset_invalid(stream_id, offset));
+                    return Err(new_stream_offset_invalid(stream_id, offset));
                 }
                 return table.read_stream_data(stream_id, offset, size);
             }
-            None => Err(Error::new_stream_not_found(stream_id)),
+            None => Err(new_stream_not_found(stream_id)),
         }
     }
 
@@ -88,7 +88,7 @@ impl Store {
         todo!()
     }
 
-    pub fn get_stream_end(&mut self, stream_id: u64) -> Result<u64> {
+    pub fn get_stream_end(&self, stream_id: u64) -> Result<u64> {
         // reverse the order
         let mut end = match self.table.load().get_stream_range(stream_id) {
             Some((_begin, end)) => Some(end),
@@ -116,12 +116,12 @@ impl Store {
                 });
         }
         if end.is_none() {
-            return Err(Error::new_stream_not_found(stream_id));
+            return Err(new_stream_not_found(stream_id));
         }
         return Ok(end.unwrap());
     }
 
-    pub fn get_stream_begin(&mut self, stream_id: u64) -> Result<u64> {
+    pub fn get_stream_begin(&self, stream_id: u64) -> Result<u64> {
         let mut begin = self
             .segment_files
             .lock()
@@ -149,7 +149,7 @@ impl Store {
         }
 
         if begin.is_none() {
-            return Err(Error::new_stream_not_found(stream_id));
+            return Err(new_stream_not_found(stream_id));
         }
         Ok(begin.unwrap())
     }

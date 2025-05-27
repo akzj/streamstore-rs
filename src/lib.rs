@@ -1,5 +1,5 @@
 pub mod entry;
-mod error;
+mod errors;
 mod mem_table;
 pub mod options;
 mod reader;

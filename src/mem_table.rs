@@ -1,4 +1,4 @@
-use crate::{entry::Entry, error::Error, table::StreamTable};
+use crate::{entry::Entry, errors, table::StreamTable};
 use anyhow::Result;
 use std::{
     collections::HashMap,
@@ -55,7 +55,7 @@ impl MemTable {
         if let Some(stream_table) = guard.get(&stream_id) {
             return stream_table.read_stream_data(offset, size);
         }
-        Err(Error::new_stream_not_found(stream_id))
+        Err(errors::new_stream_not_found(stream_id))
     }
 
     // return the stream offset

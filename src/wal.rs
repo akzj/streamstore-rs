@@ -1,8 +1,8 @@
 use crate::{
     entry::{Encoder, Entry},
-    error::Error,
+    errors::{self},
 };
-use anyhow::{Context, Result};
+use anyhow::{Context, Error, Result};
 
 use std::{
     fs::File,
@@ -18,31 +18,32 @@ pub struct WalInner {
     file: Mutex<File>,
     dir: String,
     max_size: u64,
+    file_size: atomic::AtomicU64,
     last_entry: atomic::AtomicU64,
     sender: SyncSender<Entry>,
     next: SyncSender<Vec<Entry>>,
     receiver: Mutex<Receiver<Entry>>,
-    err_handler: std::sync::Mutex<Box<dyn Fn(Error) + Send + Sync>>,
+    err_handler: std::sync::Mutex<Box<dyn Fn(anyhow::Error) + Send + Sync>>,
 }
 
 impl WalInner {
-    pub fn close(&mut self) -> Result<(), Error> {
+    pub fn close(&mut self) -> Result<()> {
         // Close the WAL file
         self.file
             .lock()
             .unwrap()
             .sync_all()
-            .map_err(Error::new_io_error)?;
+            .map_err(errors::new_io_error)?;
         Ok(())
     }
 
-    pub fn batch_write(&self, items: &[Entry]) -> Result<(), Error> {
+    pub fn batch_write(&self, items: &[Entry]) -> Result<()> {
         assert!(!items.is_empty(), "Items cannot be empty");
         assert!(
             items[0].id == self.last_entry.load(atomic::Ordering::Relaxed) + 1,
             "Items must be in order"
         );
-
+        self.try_to_rotate()?;
         // Append data to the stream
         let mut buffer = Vec::new();
         for item in items {
@@ -51,48 +52,50 @@ impl WalInner {
             self.last_entry.store(item.id, atomic::Ordering::SeqCst);
         }
 
-        match self.file.lock().unwrap().write_all(&buffer) {
-            Ok(_) => {}
+        let mut file_guard = self.file.lock().unwrap();
+        match file_guard.write_all(&buffer) {
+            Ok(_) => {
+                // Update the file size
+                let _ = self
+                    .file_size
+                    .fetch_add(buffer.len() as u64, atomic::Ordering::Relaxed);
+            }
             Err(e) => {
-                return Err(Error::new_io_error(e));
+                return Err(errors::new_io_error(e));
             }
         }
         // Flush the file to ensure all data is written
-        self.file
-            .lock()
-            .unwrap()
-            .flush()
-            .map_err(Error::new_io_error)?;
-
-        self.try_to_rotate()?;
+        file_guard.flush().map_err(errors::new_io_error)?;
 
         Ok(())
     }
 
     // Rotate the WAL file
-    pub fn try_to_rotate(&self) -> Result<(), Error> {
-        let mut file_guard = self.file.lock().unwrap();
-
-        let metadata = file_guard.metadata().map_err(Error::new_io_error)?;
-        // check if the file size is greater than the rotate size
-        if metadata.len() < self.max_size {
+    pub fn try_to_rotate(&self) -> Result<()> {
+        let file_size = self.file_size.load(atomic::Ordering::Relaxed);
+        if file_size < self.max_size {
             return Ok(());
         }
-        file_guard.sync_all().map_err(Error::new_io_error)?;
+
+        let mut file_guard = self.file.lock().unwrap();
+
+        file_guard.sync_all().map_err(errors::new_io_error)?;
 
         let filename = std::path::Path::new(&self.dir).join(format!(
             "{}.wal",
-            self.last_entry.fetch_add(1, atomic::Ordering::SeqCst)
+            self.last_entry.load(atomic::Ordering::Relaxed) + 1
         ));
         // Close the current file
-        *file_guard = File::create(&filename).map_err(Error::new_io_error)?;
+        *file_guard = File::create(&filename).map_err(errors::new_io_error)?;
+
+        self.file_size.store(0, atomic::Ordering::Relaxed);
 
         println!("WAL file rotated to {}", filename.to_str().unwrap());
 
         Ok(())
     }
 
-    pub fn run(&self) -> Result<(), Error> {
+    pub fn run(&self) -> Result<()> {
         // Start the WAL thread
         loop {
             let item = self.receiver.lock().unwrap().recv().unwrap();
@@ -126,7 +129,10 @@ impl WalInner {
                 Err(e) => {
                     // Handle the error
                     println!("Error sending to next: {:?}", e);
-                    self.err_handler.lock().unwrap()(Error::new_wal_channel_send_error());
+                    self.err_handler.lock().unwrap()(anyhow::anyhow!(
+                        "Error sending to next: {:?}",
+                        e
+                    ));
                 }
             }
         }
@@ -157,14 +163,18 @@ impl Wal {
         err_handler: Box<dyn Fn(Error) + Send + Sync>,
     ) -> Self {
         let (sender, receiver) = std::sync::mpsc::sync_channel(1024);
+
+        let file_size = file.metadata().expect("Failed to get file metadata").len();
+
         Wal(Arc::new(WalInner {
-            file: Mutex::new(file),
             dir,
-            max_size,
-            last_entry: atomic::AtomicU64::new(last_entry),
-            sender,
             next,
+            sender,
+            max_size,
+            file: Mutex::new(file),
             receiver: Mutex::new(receiver),
+            last_entry: atomic::AtomicU64::new(last_entry),
+            file_size: atomic::AtomicU64::new(file_size),
             err_handler: std::sync::Mutex::new(err_handler),
         }))
     }

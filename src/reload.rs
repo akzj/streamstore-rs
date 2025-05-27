@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use std::{
     fs::{File, OpenOptions},
     io::Seek,
+    os,
     rc::Rc,
     sync::Arc,
     vec,
@@ -9,7 +10,7 @@ use std::{
 
 use crate::{
     entry::Decoder,
-    error::Error,
+    errors,
     mem_table::{GetStreamOffsetFn, MemTable},
     segments::Segment,
 };
@@ -24,8 +25,8 @@ pub fn reload_segments(segment_path: &str) -> Result<Vec<Arc<Segment>>> {
 
     let mut segment_files = vec![];
     for entry in std::fs::read_dir(&segment_path).context("Failed to read segment directory")? {
-        let entry = entry.map_err(Error::new_io_error)?;
-        if !entry.file_type().map_err(Error::new_io_error)?.is_file() {
+        let entry = entry.map_err(errors::new_io_error)?;
+        if !entry.file_type().map_err(errors::new_io_error)?.is_file() {
             continue;
         }
         //segment path join file name
@@ -72,11 +73,21 @@ fn list_wal_files(wal_path: &str) -> Result<Vec<(String, u64)>> {
             }
 
             // Open the WAL file
-            let mut file = File::open(filename).map_err(Error::new_io_error)?;
+            let mut file = File::open(filename).map_err(errors::new_io_error)?;
+
+            // check file is empty
+            if file.metadata().map_err(errors::new_io_error)?.len() == 0 {
+                drop(file);
+                log::warn!("WAL file is empty: {}. delete it", filename);
+                std::fs::remove_file(filename).context("Failed to remove empty WAL file")?;
+                continue;
+            }
+
             let mut entry_index = 0;
             // Decode the entries from the WAL file
             file.decode(Box::new(|entry| {
                 // Handle the entry
+                log::info!("decode {} first entry id {}", filename, entry.id);
                 entry_index = entry.id;
                 Ok(false)
             }))?;
@@ -109,7 +120,8 @@ pub fn reload_wals(
     let mut tables = Vec::new();
     // Reload the WAL files
     for (filename, _entry_index) in &wals {
-        let mut file = File::open(&filename).map_err(Error::new_io_error)?;
+        log::info!("Reloading WAL file: {}", filename);
+        let mut file = File::open(&filename).map_err(errors::new_io_error)?;
         file.decode(Box::new(|entry| {
             // Handle the entry
             if entry.id < last_segment_entry_index {
@@ -149,21 +161,11 @@ pub fn reload_wals(
         .write(true)
         .create(true)
         .open(file_name)
-        .map_err(Error::new_io_error)?;
+        .map_err(errors::new_io_error)?;
 
     // seek to the end of the file
     file.seek(std::io::SeekFrom::End(0))
-        .map_err(Error::new_io_error)?;
-
-    // let wal_inner = WalInner::new(file, max_wal_size, wal_path.to_string());
-
-    // let mut wal = Wal::new(Box::new(|err| {}));
-
-    // let (sender, receive) = std::sync::mpsc::sync_channel(1000);
-
-    // *self.inner.entry_receiver.lock().unwrap() = receive;
-
-    // wal.start(wal_inner, sender)?;
+        .map_err(errors::new_io_error)?;
 
     Ok((tables, file))
 }

@@ -1,4 +1,4 @@
-use crate::error::Error;
+use crate::errors::Error;
 use anyhow::Result;
 
 const STREAM_DATA_BUFFER_CAP: u64 = 1024 * 128; // 128KB

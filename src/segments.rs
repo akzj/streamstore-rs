@@ -1,4 +1,4 @@
-use crate::{error::Error, mem_table::MemTable};
+use crate::{errors, mem_table::MemTable};
 use anyhow::{Context, Result};
 use std::{
     fs::File,
@@ -52,9 +52,9 @@ impl Segment {
         }
     }
 
-    pub fn open(file_name: path::PathBuf) -> Result<Segment, Error> {
-        let file = File::open(&file_name).map_err(Error::new_io_error)?;
-        let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(Error::new_io_error)?;
+    pub fn open(file_name: path::PathBuf) -> Result<Segment> {
+        let file = File::open(&file_name).map_err(errors::new_io_error)?;
+        let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(errors::new_io_error)?;
         let segment = Segment {
             file,
             data: mmap,
@@ -131,7 +131,7 @@ pub fn generate_segment<P: AsRef<Path>>(segment_file_path: P, table: &MemTable) 
 
     let temp_file_path = segment_file_path.as_ref().with_extension("tmp");
 
-    let mut file = File::create(&temp_file_path).map_err(Error::new_io_error)?;
+    let mut file = File::create(&temp_file_path).map_err(errors::new_io_error)?;
 
     let mut segment_stream_headers = Vec::new();
 
@@ -179,7 +179,7 @@ pub fn generate_segment<P: AsRef<Path>>(segment_file_path: P, table: &MemTable) 
             SEGMENT_HEADER_SIZE as usize,
         )
     })
-    .map_err(Error::new_io_error)?;
+    .map_err(errors::new_io_error)?;
 
     offset += SEGMENT_STREAM_HEADER_SIZE as u64 * segment_stream_headers.len() as u64;
 
@@ -195,7 +195,7 @@ pub fn generate_segment<P: AsRef<Path>>(segment_file_path: P, table: &MemTable) 
                 SEGMENT_STREAM_HEADER_SIZE as usize,
             )
         })
-        .map_err(Error::new_io_error)?;
+        .map_err(errors::new_io_error)?;
     }
 
     // Write the stream data to the file
@@ -207,24 +207,24 @@ pub fn generate_segment<P: AsRef<Path>>(segment_file_path: P, table: &MemTable) 
                     stream_data.size() as usize,
                 )
             })
-            .map_err(Error::new_io_error)?;
+            .map_err(errors::new_io_error)?;
         }
     }
 
     // flush the file to disk
-    file.flush().map_err(Error::new_io_error)?;
-    file.sync_all().map_err(Error::new_io_error)?;
+    file.flush().map_err(errors::new_io_error)?;
+    file.sync_all().map_err(errors::new_io_error)?;
 
     // close the file
     drop(file);
 
     // rename the file
-    std::fs::rename(temp_file_path, &segment_file_path).map_err(Error::new_io_error)?;
+    std::fs::rename(temp_file_path, &segment_file_path).map_err(errors::new_io_error)?;
 
     // open file with read only
-    let file = File::open(&segment_file_path).map_err(Error::new_io_error)?;
+    let file = File::open(&segment_file_path).map_err(errors::new_io_error)?;
 
-    let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(Error::new_io_error)?;
+    let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(errors::new_io_error)?;
     let segment = Segment {
         file,
         file_name: segment_file_path.as_ref().to_path_buf(),

@@ -1,4 +1,4 @@
-use crate::{entry::DataType, error::Error};
+use crate::{entry::DataType, errors::Error};
 use anyhow::Result;
 
 pub trait StreamReader {
