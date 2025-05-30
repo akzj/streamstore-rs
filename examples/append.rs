@@ -52,7 +52,7 @@ fn main() {
 
         Some(Box::new(move |result| match result {
             Ok(entry) => {
-                log::info!("Append success: {:?}", entry);
+                //                log::info!("Append success: {:?}", entry);
                 let (lock, cvar) = &*cond;
                 let mut count = lock.lock().unwrap();
                 *count -= 1;
@@ -64,9 +64,10 @@ fn main() {
         }) as AppendEntryResultFn)
     };
 
-    for i in 0..1 {
+    let count = 1000;
+    for i in 0..count {
         let data = format!("hello world {}", i);
-        log::info!("Appending entry: {}", data);
+        //log::info!("Appending entry: {}", data);
         store
             .append(1, data.into(), make_callback(cond.clone()))
             .unwrap();

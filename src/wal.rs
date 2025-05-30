@@ -84,10 +84,18 @@ impl WalInner {
 
         file_guard.sync_all().map_err(errors::new_io_error)?;
 
+        let filename = filename::file_name(&*file_guard).context("get filename error")?;
+
+        self.wal_files
+            .lock()
+            .unwrap()
+            .insert(self.last_entry.load(atomic::Ordering::Relaxed), filename);
+
         let filename = std::path::Path::new(&self.dir).join(format!(
             "{}.wal",
             self.last_entry.load(atomic::Ordering::Relaxed) + 1
         ));
+
         // Close the current file
         *file_guard = File::create(&filename).map_err(errors::new_io_error)?;
 
@@ -183,10 +191,15 @@ impl Wal {
     }
 
     pub fn gc(&self, last_entry_id: u64) -> Result<()> {
+        log::info!(
+            "Performing garbage collection on WAL files, last_entry_id: {}",
+            last_entry_id
+        );
         // Perform garbage collection on the WAL files
         let mut to_removes = vec![];
         let mut wal_files = self.wal_files.lock().unwrap();
         for (id, path) in wal_files.iter() {
+            log::debug!("Checking WAL file: {}, id: {}", path.display(), id);
             if *id <= last_entry_id {
                 // Remove files that are no longer needed
                 if let Err(e) = std::fs::remove_file(path) {

@@ -64,7 +64,7 @@ impl Segment {
     }
 
     pub fn entry_index(&self) -> (u64, u64) {
-        let header = self.read_header();
+        let header = self.get_segment_header();
         (header.first_entry, header.last_entry)
     }
 
@@ -72,12 +72,12 @@ impl Segment {
         self.filename.clone()
     }
 
-    pub fn read_header(&self) -> SegmentHeader {
+    pub fn get_segment_header(&self) -> SegmentHeader {
         unsafe { &*(self.data.as_ptr() as *const SegmentHeader) }.clone()
     }
 
     pub fn get_stream_headers(&self) -> &[SegmentStreamHeader] {
-        let header = self.read_header();
+        let header = self.get_segment_header();
         unsafe {
             std::slice::from_raw_parts(
                 self.data
@@ -161,17 +161,24 @@ pub fn generate_segment<P: AsRef<Path>>(segment_file_path: P, table: &MemTable) 
             };
             segment_stream_headers.push(stream_header);
         });
+    segment_stream_headers.sort_by(|a, b| a.stream_id.cmp(&b.stream_id));
 
     let segment_header = SegmentHeader {
         first_entry: table.get_first_entry(),
         last_entry: table.get_last_entry(),
         version: SEGMENT_HEADER_VERSION_V1,
-        stream_headers_offset: SEGMENT_STREAM_HEADER_SIZE,
+        stream_headers_offset: SEGMENT_HEADER_SIZE,
         stream_headers_count: segment_stream_headers.len() as u64,
     };
-    segment_stream_headers.sort_by(|a, b| a.stream_id.cmp(&b.stream_id));
 
-    let mut offset = SEGMENT_HEADER_SIZE as u64;
+    log::debug!(
+        "Segment {} Header: first_entry: {}, last_entry: {}, stream_headers_count: {}",
+        segment_file_path.as_ref().display(),
+        segment_header.first_entry,
+        segment_header.last_entry,
+        segment_header.stream_headers_count
+    );
+
     // Write the segment stream headers to the file
     file.write_all(unsafe {
         std::slice::from_raw_parts(
@@ -181,21 +188,41 @@ pub fn generate_segment<P: AsRef<Path>>(segment_file_path: P, table: &MemTable) 
     })
     .map_err(errors::new_io_error)?;
 
+    let mut offset = SEGMENT_HEADER_SIZE as u64;
     offset += SEGMENT_STREAM_HEADER_SIZE as u64 * segment_stream_headers.len() as u64;
 
-    // Write the segment stream headers to the file
+    // update the file offset
     for stream_header in segment_stream_headers.iter_mut() {
-        // update the file offset
         stream_header.file_offset = offset;
         offset += stream_header.size;
+    }
 
-        file.write_all(unsafe {
+    let stream_header = segment_stream_headers.as_ptr() as *const SegmentStreamHeader;
+    let data = unsafe {
+        std::slice::from_raw_parts(
+            stream_header as *const SegmentStreamHeader as *const u8,
+            SEGMENT_STREAM_HEADER_SIZE as usize * segment_stream_headers.len() as usize,
+        )
+    };
+    file.write_all(data).map_err(errors::new_io_error)?;
+
+    // Verify that the segment stream headers are written correctly
+    {
+        let temp_stream_headers = unsafe {
             std::slice::from_raw_parts(
-                stream_header as *const SegmentStreamHeader as *const u8,
-                SEGMENT_STREAM_HEADER_SIZE as usize,
+                data.as_ptr() as *const SegmentStreamHeader,
+                segment_stream_headers.len(),
             )
-        })
-        .map_err(errors::new_io_error)?;
+        };
+        assert!(temp_stream_headers.len() == segment_stream_headers.len());
+        for (i, stream_header) in temp_stream_headers.iter().enumerate() {
+            assert!(stream_header.stream_id == segment_stream_headers[i].stream_id);
+            assert!(stream_header.file_offset == segment_stream_headers[i].file_offset);
+            assert!(stream_header.size == segment_stream_headers[i].size);
+            assert!(stream_header.offset == segment_stream_headers[i].offset);
+            assert!(stream_header.version == segment_stream_headers[i].version);
+            assert!(stream_header.crc_check_sum == segment_stream_headers[i].crc_check_sum);
+        }
     }
 
     // Write the stream data to the file
@@ -234,4 +261,73 @@ pub fn generate_segment<P: AsRef<Path>>(segment_file_path: P, table: &MemTable) 
     // rename the file
 
     Ok(segment)
+}
+
+#[test]
+fn test_segment_header_size() {
+    env_logger::init();
+    assert_eq!(
+        SEGMENT_HEADER_SIZE,
+        std::mem::size_of::<SegmentHeader>() as u64
+    );
+    assert_eq!(
+        SEGMENT_STREAM_HEADER_SIZE,
+        std::mem::size_of::<SegmentStreamHeader>() as u64
+    );
+
+    let get_stream_offset: crate::mem_table::GetStreamOffsetFn =
+        std::sync::Arc::new(Box::new(|_stream_id| Ok(0)));
+
+    let memtable = MemTable::new(&get_stream_offset);
+
+    let mut entry_id = 0;
+    for i in 0..10 {
+        for _j in 0..1000 {
+            let stream_id = i + 1;
+            let data = "hello world".as_bytes().to_vec();
+            entry_id += 1;
+            memtable
+                .append(&crate::entry::Entry {
+                    version: 1,
+                    id: entry_id,
+                    stream_id: stream_id,
+                    data: data,
+                    callback: None,
+                })
+                .unwrap();
+        }
+    }
+
+    let segment_file_path = path::PathBuf::from("test_segment.bin");
+    let segment = generate_segment(&segment_file_path, &memtable).unwrap();
+
+    let seg_header = segment.get_segment_header();
+    assert!(seg_header.version == SEGMENT_HEADER_VERSION_V1);
+    assert!(seg_header.first_entry == 1);
+    assert!(seg_header.last_entry == entry_id);
+    assert!(seg_header.stream_headers_offset == SEGMENT_HEADER_SIZE);
+    assert!(seg_header.stream_headers_count == 10);
+
+    let mut file_offset =
+        SEGMENT_HEADER_SIZE + SEGMENT_STREAM_HEADER_SIZE * seg_header.stream_headers_count;
+    for (index, header) in segment.get_stream_headers().iter().enumerate() {
+        assert!(header.version == SEGMENT_STREAM_HEADER_VERSION_V1);
+        assert!(header.stream_id == index as u64 + 1);
+        assert!(header.offset == 0);
+        assert!(
+            header.file_offset == file_offset,
+            "Stream ID: {}, expected file_offset: {}, got: {}",
+            header.stream_id,
+            file_offset,
+            header.file_offset
+        );
+        assert!(
+            header.size == "hello world".as_bytes().len() as u64 * 1000,
+            "header.size {}",
+            header.size
+        ); // 1000 entries * 10 bytes each
+        assert!(header.crc_check_sum == 0); // checksum is not calculated in this test
+
+        file_offset += header.size;
+    }
 }

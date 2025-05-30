@@ -77,14 +77,30 @@ impl Store {
     pub fn read(&self, stream_id: u64, offset: u64, size: u64) -> Result<DataType> {
         let table = self.table.load();
         match table.get_stream_range(stream_id) {
-            Some((start, end)) => {
-                if offset < start || offset + size > end {
+            Some((start, _end)) => {
+                if offset >= start {
+                    return table.read_stream_data(stream_id, offset - start, size);
+                } else {
                     return Err(new_stream_offset_invalid(stream_id, offset));
                 }
-                return table.read_stream_data(stream_id, offset, size);
             }
-            None => Err(new_stream_not_found(stream_id)),
-        }
+            None => {
+                // If not found in the main table, check the memtables
+                for mem_table in self.mem_tables.lock().unwrap().iter() {
+                    match mem_table.get_stream_range(stream_id) {
+                        Some((start, _end)) => {
+                            if offset >= start {
+                                return mem_table.read_stream_data(stream_id, offset - start, size);
+                            } else {
+                                return Err(new_stream_offset_invalid(stream_id, offset));
+                            }
+                        }
+                        None => continue,
+                    }
+                }
+            },
+        };
+        Err(new_stream_not_found(stream_id))
     }
 
     fn get_reader(&mut self, stream_id: u64) -> Result<Box<dyn StreamReader>, Error> {

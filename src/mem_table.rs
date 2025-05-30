@@ -60,6 +60,14 @@ impl MemTable {
 
     // return the stream offset
     pub fn append(&self, entry: &Entry) -> Result<u64> {
+        assert!(entry.stream_id != 0, "Stream ID cannot be zero");
+        assert!(entry.data.len() > 0, "Entry data cannot be empty");
+        assert!(entry.id > 0, "Entry ID must be greater than zero");
+        assert!(
+            entry.id > self.last_entry.load(std::sync::atomic::Ordering::SeqCst),
+            "Entry ID must be greater than the last entry ID"
+        );
+
         let data_len = entry.data.len() as u64;
 
         let mut guard = self.stream_tables.lock().unwrap();

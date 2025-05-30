@@ -3,7 +3,7 @@ use std::{
     collections::HashMap,
     fs::{File, OpenOptions},
     io::Seek,
-    path::{Path, PathBuf},
+    path::PathBuf,
     rc::Rc,
     sync::Arc,
     vec,

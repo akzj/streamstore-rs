@@ -1,7 +1,4 @@
-use std::{
-    fs::File,
-    io::{Read, Write},
-};
+use std::{fs::File, io::{Read, Write}};
 
 use anyhow::{Error, anyhow};
 
@@ -132,7 +129,7 @@ fn test_entry_encode() {
 
     // write the encoded data to a file
     let mut file = File::create("test_entry.bin").expect("Failed to create file");
-    file.write(&encoded).expect("Failed to write to file");
+    file.write_all(&encoded).expect("Failed to write to file");
 
     file.sync_all().expect("Failed to flush file");
     drop(file);
