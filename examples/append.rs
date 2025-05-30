@@ -88,14 +88,5 @@ fn main() {
     let end = store.get_stream_end(1).unwrap();
     log::info!("Stream end: {:?}", end);
 
-    let res = store.read(1, 0, end);
-    match res {
-        Ok(data) => {
-            // vec to string
-            log::info!("Read entries: {}", String::from_utf8(data).unwrap().len());
-        }
-        Err(e) => {
-            log::error!("Failed to read entries: {:?}", e);
-        }
-    }
+    
 }

@@ -23,21 +23,21 @@ use crate::{
     wal::Wal,
 };
 
-type SegmentArc = Arc<Segment>;
+pub(crate) type SegmentArc = Arc<Segment>;
 
 pub struct StreamStoreInner {
     // segment files
     wal: Wal,
     config: Options,
     entry_index: AtomicU64,
-    table: ArcSwap<MemTable>,
-    mem_tables: Mutex<Vec<MemTableArc>>,
-    segment_files: Mutex<Vec<SegmentArc>>,
-    offsets: Arc<Mutex<HashMap<u64, u64>>>,
+    pub(crate) table: ArcSwap<MemTable>,
+    pub(crate) mem_tables: Mutex<Vec<MemTableArc>>,
+    pub(crate) segment_files: Mutex<Vec<SegmentArc>>,
+    pub(crate) offsets: Arc<Mutex<HashMap<u64, u64>>>,
     entry_receiver: Mutex<Receiver<Vec<Entry>>>,
     write_segment_sender: Arc<SyncSender<(path::PathBuf, MemTableArc)>>,
     write_segment_receiver: Mutex<Receiver<(path::PathBuf, MemTableArc)>>,
-    is_readonly: Arc<atomic::AtomicBool>,
+    pub(crate) is_readonly: Arc<atomic::AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -50,63 +50,39 @@ impl std::ops::Deref for Store {
     }
 }
 
-impl Store {
-    pub fn append(
-        &self,
-        stream_id: u64,
-        data: DataType,
-        callback: Option<AppendEntryResultFn>,
-    ) -> Result<()> {
-        // Check if the store is read-only
-        if self.is_readonly.load(atomic::Ordering::SeqCst) {
-            return Err(errors::new_store_is_read_only());
+impl StreamStoreInner {
+    pub fn get_stream_begin(&self, stream_id: u64) -> Result<u64> {
+        let mut begin = self
+            .segment_files
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|segment| match segment.get_stream_range(stream_id) {
+                Some((begin, _end)) => return Some(begin),
+                None => return None,
+            });
+
+        if begin.is_none() {
+            begin = self.mem_tables.lock().unwrap().iter().find_map(|table| {
+                match table.get_stream_range(stream_id) {
+                    Some((begin, _end)) => return Some(begin),
+                    None => return None,
+                }
+            });
         }
-        let id = self
-            .entry_index
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-        self.wal.write(Entry {
-            version: 1,
-            id: id,
-            stream_id,
-            data,
-            callback: callback,
-        })
+        if begin.is_none() {
+            begin = match self.table.load().get_stream_range(stream_id) {
+                Some((begin, _end)) => Some(begin),
+                None => None,
+            };
+        }
+
+        if begin.is_none() {
+            return Err(new_stream_not_found(stream_id));
+        }
+        Ok(begin.unwrap())
     }
-
-    pub fn read(&self, stream_id: u64, offset: u64, size: u64) -> Result<DataType> {
-        let table = self.table.load();
-        match table.get_stream_range(stream_id) {
-            Some((start, _end)) => {
-                if offset >= start {
-                    return table.read_stream_data(stream_id, offset - start, size);
-                } else {
-                    return Err(new_stream_offset_invalid(stream_id, offset));
-                }
-            }
-            None => {
-                // If not found in the main table, check the memtables
-                for mem_table in self.mem_tables.lock().unwrap().iter() {
-                    match mem_table.get_stream_range(stream_id) {
-                        Some((start, _end)) => {
-                            if offset >= start {
-                                return mem_table.read_stream_data(stream_id, offset - start, size);
-                            } else {
-                                return Err(new_stream_offset_invalid(stream_id, offset));
-                            }
-                        }
-                        None => continue,
-                    }
-                }
-            },
-        };
-        Err(new_stream_not_found(stream_id))
-    }
-
-    fn get_reader(&mut self, stream_id: u64) -> Result<Box<dyn StreamReader>, Error> {
-        todo!()
-    }
-
     pub fn get_stream_end(&self, stream_id: u64) -> Result<u64> {
         // reverse the order
         let mut end = match self.table.load().get_stream_range(stream_id) {
@@ -140,40 +116,7 @@ impl Store {
         return Ok(end.unwrap());
     }
 
-    pub fn get_stream_begin(&self, stream_id: u64) -> Result<u64> {
-        let mut begin = self
-            .segment_files
-            .lock()
-            .unwrap()
-            .iter()
-            .find_map(|segment| match segment.get_stream_range(stream_id) {
-                Some((begin, _end)) => return Some(begin),
-                None => return None,
-            });
-
-        if begin.is_none() {
-            begin = self.mem_tables.lock().unwrap().iter().find_map(|table| {
-                match table.get_stream_range(stream_id) {
-                    Some((begin, _end)) => return Some(begin),
-                    None => return None,
-                }
-            });
-        }
-
-        if begin.is_none() {
-            begin = match self.table.load().get_stream_range(stream_id) {
-                Some((begin, _end)) => Some(begin),
-                None => None,
-            };
-        }
-
-        if begin.is_none() {
-            return Err(new_stream_not_found(stream_id));
-        }
-        Ok(begin.unwrap())
-    }
-
-    pub fn get_stream_range(&mut self, stream_id: u64) -> Result<(u64, u64)> {
+    pub fn get_stream_range(&self, stream_id: u64) -> Result<(u64, u64)> {
         let res = self.get_stream_begin(stream_id);
         match res {
             Ok(begin) => match self.get_stream_end(stream_id) {
@@ -182,6 +125,82 @@ impl Store {
             },
             Err(e) => Err(e),
         }
+    }
+}
+
+impl Store {
+    pub fn append(
+        &self,
+        stream_id: u64,
+        data: DataType,
+        callback: Option<AppendEntryResultFn>,
+    ) -> Result<()> {
+        // Check if the store is read-only
+        if self.is_readonly.load(atomic::Ordering::SeqCst) {
+            return Err(errors::new_store_is_read_only());
+        }
+        let id = self
+            .entry_index
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+        self.wal.write(Entry {
+            version: 1,
+            id: id,
+            stream_id,
+            data,
+            callback: callback,
+        })
+    }
+
+    // pub fn read(&self, stream_id: u64, offset: u64, size: u64) -> Result<DataType> {
+    //     let table = self.table.load();
+    //     match table.get_stream_range(stream_id) {
+    //         Some((start, _end)) => {
+    //             if offset >= start {
+    //                 return table.read_stream_data(stream_id, offset - start, size);
+    //             } else {
+    //                 return Err(new_stream_offset_invalid(stream_id, offset));
+    //             }
+    //         }
+    //         None => {
+    //             // If not found in the main table, check the memtables
+    //             for mem_table in self.mem_tables.lock().unwrap().iter() {
+    //                 match mem_table.get_stream_range(stream_id) {
+    //                     Some((start, _end)) => {
+    //                         if offset >= start {
+    //                             return mem_table.read_stream_data(stream_id, offset - start, size);
+    //                         } else {
+    //                             return Err(new_stream_offset_invalid(stream_id, offset));
+    //                         }
+    //                     }
+    //                     None => continue,
+    //                 }
+    //             }
+    //         },
+    //     };
+    //     Err(new_stream_not_found(stream_id))
+    // }
+
+    fn new_stream_reader(&mut self, stream_id: u64) -> Result<Box<StreamReader>> {
+        self.offsets.lock().unwrap().get(&stream_id).map_or_else(
+            || Err(new_stream_not_found(stream_id)),
+            |_offset| {
+                let reader = StreamReader::new(self.0.clone(), stream_id);
+                Ok(Box::new(reader))
+            },
+        )
+    }
+
+    pub fn get_stream_end(&self, stream_id: u64) -> Result<u64> {
+        self.0.get_stream_end(stream_id)
+    }
+
+    pub fn get_stream_begin(&self, stream_id: u64) -> Result<u64> {
+        self.0.get_stream_begin(stream_id)
+    }
+
+    pub fn get_stream_range(&self, stream_id: u64) -> Result<(u64, u64)> {
+        self.0.get_stream_range(stream_id)
     }
 
     fn get_last_segment_entry_index(&self) -> Result<u64> {
