@@ -2,7 +2,7 @@ use crate::{errors, mem_table::MemTable};
 use anyhow::Result;
 use std::{
     fs::File,
-    io::Write,
+    io::{self, Write},
     path::{self, Path},
 };
 
@@ -91,7 +91,7 @@ impl Segment {
 
     pub fn get_stream_range(&self, stream_id: u64) -> Option<(u64, u64)> {
         let stream_header = self.find_stream_header(stream_id)?;
-        let offset = stream_header.file_offset;
+        let offset = stream_header.offset;
         let size = stream_header.size;
         Some((offset, offset + size))
     }
@@ -109,6 +109,47 @@ impl Segment {
             })
             .ok()
             .map(|index| self.get_stream_headers()[index].clone())
+    }
+
+    pub fn read_stream(&self, stream_id: u64, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+        let stream_header = self.find_stream_header(stream_id);
+        return match stream_header {
+            Some(stream_header) => {
+                if stream_header.offset <= offset
+                    && offset < stream_header.size + stream_header.offset
+                {
+                    let stream_data = unsafe {
+                        std::slice::from_raw_parts(
+                            self.data.as_ptr().add(stream_header.file_offset as usize) as *const u8,
+                            stream_header.size as usize,
+                        )
+                    };
+
+                    let start = (offset - stream_header.offset) as usize;
+                    let end = (start + buf.len()).min(stream_data.len());
+
+                    let data_to_copy = &stream_data[start..end];
+                    let bytes_to_copy = data_to_copy.len();
+                    if bytes_to_copy == 0 {
+                        return Ok(0); // No data to copy
+                    }
+                    buf[..bytes_to_copy].copy_from_slice(data_to_copy);
+                    Ok(bytes_to_copy)
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "Offset {} is out of bounds for stream ID {} with size {}",
+                            offset, stream_id, stream_header.size
+                        ),
+                    ))
+                }
+            }
+            None => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Stream ID {} not found", stream_id),
+            )),
+        };
     }
 
     pub fn stream_data(&self, stream_id: u64) -> Option<&[u8]> {

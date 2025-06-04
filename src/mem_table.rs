@@ -1,8 +1,7 @@
 use crate::{entry::Entry, errors, table::StreamTable};
 use anyhow::Result;
 use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex, atomic::AtomicU64},
+    collections::HashMap, io, sync::{atomic::AtomicU64, Arc, Mutex}
 };
 
 pub type MemTableArc = Arc<MemTable>;
@@ -50,12 +49,15 @@ impl MemTable {
         None
     }
 
-    pub fn read_stream_data(&self, stream_id: u64, offset: u64, size: u64) -> Result<Vec<u8>> {
+    pub fn read_stream(&self, stream_id: u64, offset: u64, buf: &mut [u8]) -> io::Result<usize>{
         let guard = self.stream_tables.lock().unwrap();
         if let Some(stream_table) = guard.get(&stream_id) {
-            return stream_table.read_stream_data(offset, size);
+            return stream_table.read_stream(offset, buf);
         }
-        Err(errors::new_stream_not_found(stream_id))
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("Stream ID {} not found", stream_id),
+        ))
     }
 
     // return the stream offset

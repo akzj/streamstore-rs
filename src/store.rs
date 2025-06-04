@@ -3,7 +3,7 @@ use std::{
     path,
     rc::Rc,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, RwLock,
         atomic::{self, AtomicU64},
         mpsc::{Receiver, SyncSender, sync_channel},
     },
@@ -31,8 +31,8 @@ pub struct StreamStoreInner {
     config: Options,
     entry_index: AtomicU64,
     pub(crate) table: ArcSwap<MemTable>,
-    pub(crate) mem_tables: Mutex<Vec<MemTableArc>>,
-    pub(crate) segment_files: Mutex<Vec<SegmentArc>>,
+    pub(crate) mem_tables: std::sync::RwLock<Vec<MemTableArc>>,
+    pub(crate) segment_files: RwLock<Vec<SegmentArc>>,
     pub(crate) offsets: Arc<Mutex<HashMap<u64, u64>>>,
     entry_receiver: Mutex<Receiver<Vec<Entry>>>,
     write_segment_sender: Arc<SyncSender<(path::PathBuf, MemTableArc)>>,
@@ -51,10 +51,19 @@ impl std::ops::Deref for Store {
 }
 
 impl StreamStoreInner {
+    // print segment files
+    pub fn print_segment_files(&self) {
+        let segment_files = self.segment_files.read().unwrap();
+        log::info!("Segment files:");
+        for segment in segment_files.iter() {
+            log::info!("  - {}", segment.filename().display());
+        }
+    }
+
     pub fn get_stream_begin(&self, stream_id: u64) -> Result<u64> {
         let mut begin = self
             .segment_files
-            .lock()
+            .read()
             .unwrap()
             .iter()
             .find_map(|segment| match segment.get_stream_range(stream_id) {
@@ -63,7 +72,7 @@ impl StreamStoreInner {
             });
 
         if begin.is_none() {
-            begin = self.mem_tables.lock().unwrap().iter().find_map(|table| {
+            begin = self.mem_tables.read().unwrap().iter().find_map(|table| {
                 match table.get_stream_range(stream_id) {
                     Some((begin, _end)) => return Some(begin),
                     None => return None,
@@ -91,7 +100,7 @@ impl StreamStoreInner {
         };
 
         if end.is_none() {
-            end = self.mem_tables.lock().unwrap().iter().find_map(|table| {
+            end = self.mem_tables.read().unwrap().iter().find_map(|table| {
                 match table.get_stream_range(stream_id) {
                     Some((_begin, end)) => return Some(end),
                     None => return None,
@@ -102,7 +111,7 @@ impl StreamStoreInner {
         if end.is_none() {
             end = self
                 .segment_files
-                .lock()
+                .read()
                 .unwrap()
                 .iter()
                 .find_map(|segment| match segment.get_stream_range(stream_id) {
@@ -152,42 +161,10 @@ impl Store {
         })
     }
 
-    // pub fn read(&self, stream_id: u64, offset: u64, size: u64) -> Result<DataType> {
-    //     let table = self.table.load();
-    //     match table.get_stream_range(stream_id) {
-    //         Some((start, _end)) => {
-    //             if offset >= start {
-    //                 return table.read_stream_data(stream_id, offset - start, size);
-    //             } else {
-    //                 return Err(new_stream_offset_invalid(stream_id, offset));
-    //             }
-    //         }
-    //         None => {
-    //             // If not found in the main table, check the memtables
-    //             for mem_table in self.mem_tables.lock().unwrap().iter() {
-    //                 match mem_table.get_stream_range(stream_id) {
-    //                     Some((start, _end)) => {
-    //                         if offset >= start {
-    //                             return mem_table.read_stream_data(stream_id, offset - start, size);
-    //                         } else {
-    //                             return Err(new_stream_offset_invalid(stream_id, offset));
-    //                         }
-    //                     }
-    //                     None => continue,
-    //                 }
-    //             }
-    //         },
-    //     };
-    //     Err(new_stream_not_found(stream_id))
-    // }
-
-    fn new_stream_reader(&mut self, stream_id: u64) -> Result<Box<StreamReader>> {
+    pub fn new_stream_reader(&self, stream_id: u64) -> Result<StreamReader> {
         self.offsets.lock().unwrap().get(&stream_id).map_or_else(
             || Err(new_stream_not_found(stream_id)),
-            |_offset| {
-                let reader = StreamReader::new(self.0.clone(), stream_id);
-                Ok(Box::new(reader))
-            },
+            |_offset| Ok(StreamReader::new(self.0.clone(), stream_id)),
         )
     }
 
@@ -204,7 +181,7 @@ impl Store {
     }
 
     fn get_last_segment_entry_index(&self) -> Result<u64> {
-        let segment_files = self.segment_files.lock().unwrap();
+        let segment_files = self.segment_files.read().unwrap();
         if segment_files.is_empty() {
             return Ok(0);
         }
@@ -214,7 +191,7 @@ impl Store {
 
     fn reload_offset(&self) {
         // reload the segments
-        for segment in self.segment_files.lock().unwrap().iter() {
+        for segment in self.segment_files.read().unwrap().iter() {
             for stream_header in segment.get_stream_headers() {
                 let stream_id = stream_header.stream_id;
                 let offset = stream_header.offset + stream_header.size;
@@ -229,8 +206,8 @@ impl Store {
         }
 
         // reload the memtable
-        for mem_table in self.mem_tables.lock().unwrap().iter() {
-            let stream_tables = mem_table.get_stream_tables();
+        for mem_tables in self.mem_tables.read().unwrap().iter() {
+            let stream_tables = mem_tables.get_stream_tables();
             for (stream_id, stream_table) in &*stream_tables {
                 match stream_table.get_stream_range() {
                     Some((_begin, end)) => {
@@ -309,10 +286,11 @@ impl Store {
             // update segment list
             let segment = Segment::open(file_name).unwrap();
 
-            let mut segment_files_guard = self.segment_files.lock().unwrap();
+            let mut segment_files_guard = self.segment_files.write().unwrap();
             segment_files_guard.push(Arc::new(segment));
-            if self.mem_tables.lock().unwrap().len() > self.config.max_tables_count as usize {
-                self.mem_tables.lock().unwrap().remove(0);
+            let mut memtables = self.mem_tables.write().unwrap();
+            if memtables.len() > self.config.max_tables_count as usize {
+                memtables.remove(0);
             }
         }
         Ok(())
@@ -358,7 +336,7 @@ impl Store {
 
                 // Check if the table size is greater than the max size
                 if table.get_size() > self.config.max_table_size {
-                    self.mem_tables.lock().unwrap().push(table.clone());
+                    self.mem_tables.write().unwrap().push(table.clone());
                     self.table
                         .store(Arc::new(MemTable::new(&get_stream_offset_fn.clone())));
 
@@ -445,8 +423,8 @@ impl Store {
             config: config.clone(),
             entry_index: AtomicU64::new(last_log_entry + 1),
             table: ArcSwap::new(Arc::new(memtable)),
-            mem_tables: Mutex::new(Vec::new()),
-            segment_files: Mutex::new(segment_files),
+            mem_tables: RwLock::new(Vec::new()),
+            segment_files: RwLock::new(segment_files),
             entry_receiver: Mutex::new(entries_receiver),
             write_segment_sender: Arc::new(write_segment_sender),
             write_segment_receiver: Mutex::new(write_segment_receiver),
