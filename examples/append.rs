@@ -1,6 +1,6 @@
 use crc::Crc;
 use std::env;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 use std::sync::{Arc, Condvar, Mutex};
 use streamstore::entry::AppendEntryResultFn;
 fn main() {
@@ -72,7 +72,7 @@ fn main() {
 
     let count = 10000;
     for i in 0..count {
-        let data = format!("hello world {}", i);
+        let data = format!("hello world {}\n", i);
         //log::info!("Appending entry: {}", data);
 
         hash.update(data.as_bytes());
@@ -128,6 +128,44 @@ fn main() {
     } else {
         log::info!("Checksum match: {}", read_check_sum);
     }
+
+    reader.seek(std::io::SeekFrom::Start(begin)).unwrap();
+
+    let crc64 = Crc::<u64>::new(&crc::CRC_64_REDIS);
+    let mut hash = crc64.digest();
+
+    let mut read_buffer = vec![];
+
+    loop {
+        let rand_sizd = rand::random::<u64>() % 100 + 1;
+        let mut buffer = vec![0; rand_sizd as usize];
+        let bytes_read = reader.read(&mut buffer).unwrap();
+        if bytes_read == 0 {
+            log::info!("End of stream reached");
+            break;
+        }
+
+        buffer.truncate(bytes_read);
+
+        read_buffer.extend_from_slice(&buffer);
+
+        hash.update(&buffer);
+    }
+
+    let multi_read_check_sum = hash.finalize();
+
+    log::info!("Multi read check sum: {}", multi_read_check_sum);
+    if multi_read_check_sum != write_check_sum {
+        log::error!(
+            "Multi read checksum mismatch: expected {}, got {}",
+            write_check_sum,
+            multi_read_check_sum
+        );
+    } else {
+        log::info!("Multi read checksum match: {}", multi_read_check_sum);
+    }
+
+    //println!("Stream data: {}", String::from_utf8_lossy(&read_buffer));
 
     // log::info!("Stream data: {:?}", String::from_utf8_lossy(&buffer));
 }

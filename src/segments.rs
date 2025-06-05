@@ -136,13 +136,7 @@ impl Segment {
                     buf[..bytes_to_copy].copy_from_slice(data_to_copy);
                     Ok(bytes_to_copy)
                 } else {
-                    Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!(
-                            "Offset {} is out of bounds for stream ID {} with size {}",
-                            offset, stream_id, stream_header.size
-                        ),
-                    ))
+                    Ok(0)
                 }
             }
             None => Err(io::Error::new(

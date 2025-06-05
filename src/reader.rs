@@ -51,19 +51,24 @@ impl StreamReader {
     fn read_from_segments(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let mut read_bytes_all = 0;
         if let Some(segment) = &self.read_segment {
+            let (begin, end) = segment.get_stream_range(self.stream_id).unwrap();
+
             log::debug!(
-                "Reading from Segment file {} for Stream ID {} at offset {}",
+                "Reading from Segment file {} for Stream ID {} at offset {} [{}, {})",
                 segment.filename().display(),
                 self.stream_id,
-                self.offset()
+                self.offset(),
+                begin,
+                end
             );
             let bytes_read = segment.read_stream(self.stream_id, self.offset(), buf)?;
-            self.offset
-                .fetch_add(bytes_read as u64, std::sync::atomic::Ordering::Relaxed);
-
-            read_bytes_all += bytes_read;
-            if read_bytes_all >= buf.len() {
-                return Ok(read_bytes_all); // Stop if we filled the buffer
+            if bytes_read > 0 {
+                self.offset
+                    .fetch_add(bytes_read as u64, std::sync::atomic::Ordering::Relaxed);
+                read_bytes_all += bytes_read;
+                if read_bytes_all >= buf.len() {
+                    return Ok(read_bytes_all); // Stop if we filled the buffer
+                }
             }
         }
 
@@ -125,6 +130,13 @@ impl StreamReader {
         let memtables = self.inner.mem_tables.read().unwrap();
         for memtable in memtables.iter() {
             if let Some((begin, end)) = memtable.get_stream_range(self.stream_id) {
+                log::debug!(
+                    "Reading from MemTable for Stream ID {} at offset {} begin {} end {}",
+                    self.stream_id,
+                    self.offset(),
+                    begin,
+                    end
+                );
                 if begin <= self.offset() && self.offset() < end {
                     let read_buf = &mut buf[read_bytes_all..];
                     let bytes_read =
@@ -150,8 +162,22 @@ impl StreamReader {
 impl io::Read for StreamReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let mut read_bytes_all = 0;
+
+        log::debug!(
+            "Starting read for Stream ID {} at offset {}",
+            self.stream_id,
+            self.offset()
+        );
+
         loop {
             let state = { *self.read_state.lock().unwrap() };
+
+            log::debug!(
+                "Current read state for Stream ID {}: {:?}",
+                self.stream_id,
+                state
+            );
+
             match state {
                 StreamReadState::None => {
                     log::info!(
@@ -245,12 +271,8 @@ impl io::Read for StreamReader {
                     return Ok(0); // No data to read
                 }
                 StreamReadState::MemTable => {
-                    log::debug!(
-                        "Reading from MemTable for Stream ID {} at offset {}",
-                        self.stream_id,
-                        self.offset()
-                    );
                     let memtable = self.inner.table.load();
+
                     let bytes_read = memtable.read_stream(
                         self.stream_id,
                         self.offset(),
@@ -258,7 +280,6 @@ impl io::Read for StreamReader {
                     )?;
                     self.offset
                         .fetch_add(bytes_read as u64, std::sync::atomic::Ordering::Relaxed);
-
                     read_bytes_all += bytes_read;
                     return Ok(read_bytes_all); // Stop if we filled the buffer
                 }
@@ -271,11 +292,6 @@ impl io::Read for StreamReader {
                     }
                 }
                 StreamReadState::Segment => {
-                    log::debug!(
-                        "Reading from Segment for Stream ID {} at offset {}",
-                        self.stream_id,
-                        self.offset()
-                    );
                     let bytes_read = self.read_from_segments(&mut buf[read_bytes_all..])?;
                     read_bytes_all += bytes_read;
                     if read_bytes_all >= buf.len() {
