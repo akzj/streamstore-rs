@@ -2,7 +2,7 @@ use std::{io, sync::Arc};
 
 use crate::{
     mem_table::MemTableArc,
-    store::{SegmentArc, StreamStoreInner},
+    store::{SegmentWeak, StreamStoreInner},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18,7 +18,7 @@ pub struct StreamReader {
     inner: Arc<StreamStoreInner>,
     offset: std::sync::atomic::AtomicU64,
     read_memtable: Option<MemTableArc>,
-    read_segment: Option<SegmentArc>,
+    read_segment: Option<SegmentWeak>,
     read_state: std::sync::Mutex<StreamReadState>,
 }
 
@@ -51,59 +51,88 @@ impl StreamReader {
     fn read_from_segments(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let mut read_bytes_all = 0;
         if let Some(segment) = &self.read_segment {
-            let (begin, end) = segment.get_stream_range(self.stream_id).unwrap();
-
-            log::debug!(
-                "Reading from Segment file {} for Stream ID {} at offset {} [{}, {})",
-                segment.filename().display(),
-                self.stream_id,
-                self.offset(),
-                begin,
-                end
-            );
-            let bytes_read = segment.read_stream(self.stream_id, self.offset(), buf)?;
-            if bytes_read > 0 {
-                self.offset
-                    .fetch_add(bytes_read as u64, std::sync::atomic::Ordering::Relaxed);
-                read_bytes_all += bytes_read;
-                if read_bytes_all >= buf.len() {
-                    return Ok(read_bytes_all); // Stop if we filled the buffer
-                }
-            }
-        }
-
-        let segment_files = self.inner.segment_files.read().unwrap();
-        for segment in segment_files.iter() {
-            if let Some((begin, end)) = segment.get_stream_range(self.stream_id) {
+            if let Some(segment) = segment.upgrade() {
+                let (begin, end) = segment.get_stream_range(self.stream_id).unwrap();
                 log::debug!(
-                    "Checking Segment file {} for Stream ID {} at offset {} begin {} end {}",
+                    "Reading from Segment file {} for Stream ID {} at offset {} [{}, {})",
                     segment.filename().display(),
                     self.stream_id,
                     self.offset(),
                     begin,
                     end
                 );
-                if begin <= self.offset() && self.offset() < end {
-                    log::debug!(
-                        "Reading from Segment file {} for Stream ID {} at offset {}",
-                        segment.filename().display(),
-                        self.stream_id,
-                        self.offset()
-                    );
-
-                    let read_buf = &mut buf[read_bytes_all..];
-                    let bytes_read =
-                        segment.read_stream(self.stream_id, self.offset(), read_buf)?;
+                let bytes_read = segment.read_stream(self.stream_id, self.offset(), buf)?;
+                if bytes_read > 0 {
                     self.offset
                         .fetch_add(bytes_read as u64, std::sync::atomic::Ordering::Relaxed);
                     read_bytes_all += bytes_read;
                     if read_bytes_all >= buf.len() {
-                        self.read_segment = Some(segment.clone());
                         return Ok(read_bytes_all); // Stop if we filled the buffer
                     }
                 }
             }
         }
+
+        if let Some(segments) = self
+            .inner
+            .segment_offset_index
+            .read()
+            .unwrap()
+            .get(&self.stream_id)
+            .map(|s| s.clone())
+        {
+            let segments = segments.read().unwrap();
+            let mut index = match segments.binary_search_by(|meta| meta.0.cmp(&self.offset())) {
+                Ok(index) => index + 1,
+                Err(index) => index,
+            };
+
+            log::debug!(
+                "Stream ID {} offset {} found in Segment files at index {}",
+                self.stream_id,
+                self.offset(),
+                index
+            );
+
+            if index < segments.len() {
+                while index < segments.len() {
+                    let segment = &segments[index].1.upgrade();
+                    if let Some(segment) = segment {
+                        let (begin, end) = segment.get_stream_range(self.stream_id).unwrap();
+                        log::debug!(
+                            "Reading from Segment file {} for Stream ID {} at offset {} [{}, {})",
+                            segment.filename().display(),
+                            self.stream_id,
+                            self.offset(),
+                            begin,
+                            end
+                        );
+                        let bytes_read = segment.read_stream(
+                            self.stream_id,
+                            self.offset(),
+                            &mut buf[read_bytes_all..],
+                        )?;
+                        self.offset
+                            .fetch_add(bytes_read as u64, std::sync::atomic::Ordering::Relaxed);
+                        read_bytes_all += bytes_read;
+                        if read_bytes_all >= buf.len() {
+                            self.read_segment = Some(Arc::downgrade(segment));
+                            return Ok(read_bytes_all);
+                        }
+                        index += 1;
+                    } else {
+                        log::debug!(
+                            "Segment file for Stream ID {} is no longer available",
+                            self.stream_id
+                        );
+                    }
+                }
+            } else {
+                // If we reach here, we have no data to read from segments
+                log::debug!("Stream ID {} not found in any Segment file", self.stream_id);
+            }
+        }
+
         *self.read_state.lock().unwrap() = StreamReadState::MemTables;
         Ok(read_bytes_all)
     }
@@ -163,20 +192,8 @@ impl io::Read for StreamReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let mut read_bytes_all = 0;
 
-        log::debug!(
-            "Starting read for Stream ID {} at offset {}",
-            self.stream_id,
-            self.offset()
-        );
-
         loop {
             let state = { *self.read_state.lock().unwrap() };
-
-            log::debug!(
-                "Current read state for Stream ID {}: {:?}",
-                self.stream_id,
-                state
-            );
 
             match state {
                 StreamReadState::None => {
@@ -233,27 +250,57 @@ impl io::Read for StreamReader {
                         }
                     }
 
-                    match self.inner.segment_files.read().unwrap().iter().find(|seg| {
-                        if let Some((begin, end)) = seg.get_stream_range(self.stream_id) {
-                            begin <= self.offset() && self.offset() < end
-                        } else {
-                            false
-                        }
-                    }) {
-                        Some(segment) => {
-                            let (begin, end) = segment.get_stream_range(self.stream_id).unwrap();
+                    let segments = self
+                        .inner
+                        .segment_offset_index
+                        .read()
+                        .unwrap()
+                        .get(&self.stream_id)
+                        .map(|seg| seg.clone());
+
+                    if let Some(segment) = segments {
+                        let segments = segment.read().unwrap();
+                        let index =
+                            match segments.binary_search_by(|meta| meta.0.cmp(&self.offset())) {
+                                Ok(index) => index + 1,
+                                Err(index) => index,
+                            };
+                        if index < segments.len() {
                             log::debug!(
-                                "Stream ID {} found in Segment begin {} end {}",
+                                "Stream ID {} found in Segment files at index {}",
                                 self.stream_id,
-                                begin,
-                                end
+                                index
                             );
-                            self.read_segment = Some(segment.clone());
-                            *self.read_state.lock().unwrap() = StreamReadState::Segment;
-                            continue;
+
+                            let segment = &segments[index].1.upgrade();
+                            if let Some(segment) = segment {
+                                let (begin, end) =
+                                    segment.get_stream_range(self.stream_id).unwrap();
+                                log::debug!(
+                                    "Stream ID {} found in Segment file {} at offset {} [{}, {})",
+                                    self.stream_id,
+                                    segment.filename().display(),
+                                    self.offset(),
+                                    begin,
+                                    end
+                                );
+                                self.read_segment = Some(Arc::downgrade(segment));
+                                *self.read_state.lock().unwrap() = StreamReadState::Segment;
+                                continue;
+                            } else {
+                                log::debug!(
+                                    "Segment file for Stream ID {} is no longer available",
+                                    self.stream_id
+                                );
+                            }
+                        } else {
+                            log::debug!(
+                                "Stream ID {} not found in any Segment file",
+                                self.stream_id
+                            );
                         }
-                        None => {}
                     }
+
                     let (begin, end) =
                         self.inner.get_stream_range(self.stream_id).map_err(|e| {
                             log::error!("Failed to get stream range: {:?}", e);

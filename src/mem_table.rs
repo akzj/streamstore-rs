@@ -1,10 +1,13 @@
-use crate::{entry::Entry, errors, table::StreamTable};
+use crate::{entry::Entry, table::StreamTable};
 use anyhow::Result;
 use std::{
-    collections::HashMap, io, sync::{atomic::AtomicU64, Arc, Mutex}
+    collections::HashMap,
+    io,
+    sync::{self, Arc, Mutex, atomic::AtomicU64},
 };
 
 pub type MemTableArc = Arc<MemTable>;
+pub type MemTableWeak = sync::Weak<MemTable>;
 pub(crate) type GetStreamOffsetFn = Arc<Box<dyn Fn(u64) -> Result<u64> + Send + Sync>>;
 pub struct MemTable {
     stream_tables: Mutex<HashMap<u64, StreamTable>>,
@@ -49,7 +52,7 @@ impl MemTable {
         None
     }
 
-    pub fn read_stream(&self, stream_id: u64, offset: u64, buf: &mut [u8]) -> io::Result<usize>{
+    pub fn read_stream(&self, stream_id: u64, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
         let guard = self.stream_tables.lock().unwrap();
         if let Some(stream_table) = guard.get(&stream_id) {
             return stream_table.read_stream(offset, buf);

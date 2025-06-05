@@ -3,7 +3,7 @@ use std::{
     path,
     rc::Rc,
     sync::{
-        Arc, Mutex, RwLock,
+        Arc, Mutex, RwLock, Weak,
         atomic::{self, AtomicU64},
         mpsc::{Receiver, SyncSender, sync_channel},
     },
@@ -24,19 +24,23 @@ use crate::{
 };
 
 pub(crate) type SegmentArc = Arc<Segment>;
+pub(crate) type SegmentWeak = Weak<Segment>;
 
 pub struct StreamStoreInner {
     // segment files
     wal: Wal,
     config: Options,
     entry_index: AtomicU64,
+    write_segment_receiver: Mutex<Receiver<(path::PathBuf, MemTableArc)>>,
+    entry_receiver: Mutex<Receiver<Vec<Entry>>>,
+    write_segment_sender: Arc<SyncSender<(path::PathBuf, MemTableArc)>>,
+
     pub(crate) table: ArcSwap<MemTable>,
     pub(crate) mem_tables: std::sync::RwLock<Vec<MemTableArc>>,
     pub(crate) segment_files: RwLock<Vec<SegmentArc>>,
     pub(crate) offsets: Arc<Mutex<HashMap<u64, u64>>>,
-    entry_receiver: Mutex<Receiver<Vec<Entry>>>,
-    write_segment_sender: Arc<SyncSender<(path::PathBuf, MemTableArc)>>,
-    write_segment_receiver: Mutex<Receiver<(path::PathBuf, MemTableArc)>>,
+    pub(crate) segment_offset_index:
+        Arc<RwLock<HashMap<u64, Arc<RwLock<Vec<(u64, SegmentWeak)>>>>>>,
     pub(crate) is_readonly: Arc<atomic::AtomicBool>,
 }
 
@@ -284,10 +288,24 @@ impl Store {
                 }
             }
             // update segment list
-            let segment = Segment::open(file_name).unwrap();
+            let segment = Arc::new(Segment::open(file_name).unwrap());
 
             let mut segment_files_guard = self.segment_files.write().unwrap();
-            segment_files_guard.push(Arc::new(segment));
+            segment_files_guard.push(segment.clone());
+
+            for stream_header in segment.get_stream_headers() {
+                let stream_id = stream_header.stream_id;
+                let offset = stream_header.offset + stream_header.size;
+                self.segment_offset_index
+                    .write()
+                    .unwrap()
+                    .entry(stream_id)
+                    .or_insert_with(|| Arc::new(RwLock::new(Vec::new())))
+                    .write()
+                    .unwrap()
+                    .push((offset, Arc::downgrade(&segment)));
+            }
+
             let mut memtables = self.mem_tables.write().unwrap();
             if memtables.len() > self.config.max_tables_count as usize {
                 memtables.remove(0);
@@ -389,6 +407,20 @@ impl Store {
             segment_files.push(Arc::new(segment));
         }
 
+        let mut segment_offset_index = HashMap::new();
+        for segment in segment_files.iter() {
+            for stream_header in segment.get_stream_headers() {
+                let stream_id = stream_header.stream_id;
+                let offset = stream_header.offset + stream_header.size;
+                segment_offset_index
+                    .entry(stream_id)
+                    .or_insert_with(|| Arc::new(RwLock::new(Vec::new())))
+                    .write()
+                    .unwrap()
+                    .push((offset, Arc::downgrade(segment)));
+            }
+        }
+
         let is_readonly = Arc::new(atomic::AtomicBool::new(false));
         let last_log_entry = memtable.get_last_entry();
 
@@ -421,6 +453,8 @@ impl Store {
         let inner = StreamStoreInner {
             wal: wal,
             config: config.clone(),
+            offsets: offset_map.clone(),
+            is_readonly: is_readonly.clone(),
             entry_index: AtomicU64::new(last_log_entry + 1),
             table: ArcSwap::new(Arc::new(memtable)),
             mem_tables: RwLock::new(Vec::new()),
@@ -428,8 +462,7 @@ impl Store {
             entry_receiver: Mutex::new(entries_receiver),
             write_segment_sender: Arc::new(write_segment_sender),
             write_segment_receiver: Mutex::new(write_segment_receiver),
-            offsets: offset_map.clone(),
-            is_readonly: is_readonly.clone(),
+            segment_offset_index: Arc::new(RwLock::new(segment_offset_index)),
         };
 
         let store = Store(Arc::new(inner));
