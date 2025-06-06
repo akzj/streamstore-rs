@@ -1,15 +1,18 @@
-use crate::{errors, mem_table::MemTable};
+use crate::{errors, mem_table::MemTable, store::SegmentArc};
 use anyhow::Result;
 use std::{
+    collections::HashMap,
+    fmt::Display,
     fs::File,
     io::{self, Write},
     path::{self, Path},
+    sync::atomic,
 };
 
 const SEGMENT_STREAM_HEADER_SIZE: u64 = std::mem::size_of::<SegmentStreamHeader>() as u64;
 const SEGMENT_HEADER_SIZE: u64 = std::mem::size_of::<SegmentHeader>() as u64;
 const SEGMENT_STREAM_HEADER_VERSION_V1: u64 = 1;
-const SEGMENT_HEADER_VERSION_V1: u64 = 1;
+const SEGMENT_HEADER_VERSION_V1: u32 = 1;
 
 #[derive(Default, Debug, Clone)]
 #[repr(C)]
@@ -27,20 +30,47 @@ pub struct SegmentStreamHeader {
     pub(crate) crc_check_sum: u64,
 }
 
-#[derive(Default, Clone, Debug)]
+#[derive(Clone, Debug)]
 #[repr(C)]
 pub struct SegmentHeader {
-    pub(crate) version: u64,
+    pub(crate) version: u32,
+    pub(crate) level: u32,
     pub(crate) last_entry: u64,
     pub(crate) first_entry: u64,
     pub(crate) stream_headers_offset: u64,
     pub(crate) stream_headers_count: u64,
+    _pading: [u8; 88], // Padding to ensure the size is 128 bytes
+}
+
+impl Default for SegmentHeader {
+    fn default() -> Self {
+        SegmentHeader {
+            version: SEGMENT_HEADER_VERSION_V1,
+            level: 0,
+            last_entry: 0,
+            first_entry: 0,
+            stream_headers_offset: SEGMENT_HEADER_SIZE,
+            stream_headers_count: 0,
+            _pading: [0; 88],
+        }
+    }
+}
+
+impl Display for SegmentHeader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "SegmentHeader {{ version: {}, level: {}, first_entry: {},last_entry: {}, stream_headers_count: {} }}",
+            self.version, self.level, self.first_entry, self.last_entry, self.stream_headers_count
+        )
+    }
 }
 
 pub struct Segment {
     file: File,
     pub filename: path::PathBuf,
     data: memmap2::Mmap,
+    drop_delete: atomic::AtomicBool,
 }
 
 impl Segment {
@@ -49,6 +79,7 @@ impl Segment {
             file,
             data,
             filename: file_name,
+            drop_delete: atomic::AtomicBool::new(false),
         }
     }
 
@@ -59,8 +90,14 @@ impl Segment {
             file,
             data: mmap,
             filename: file_name,
+            drop_delete: atomic::AtomicBool::new(false),
         };
         Ok(segment)
+    }
+
+    pub fn set_drop_delete(&self, drop_delete: bool) {
+        self.drop_delete
+            .store(drop_delete, atomic::Ordering::Relaxed);
     }
 
     pub fn entry_index(&self) -> (u64, u64) {
@@ -161,7 +198,32 @@ impl Segment {
     }
 }
 
-pub fn generate_segment<P: AsRef<Path>>(segment_file_path: P, table: &MemTable) -> Result<Segment> {
+impl Drop for Segment {
+    fn drop(&mut self) {
+        if self.drop_delete.load(atomic::Ordering::Relaxed) {
+            log::debug!("Deleting segment file: {}", self.filename.display());
+            match std::fs::remove_file(&self.filename) {
+                Err(e) => {
+                    log::warn!(
+                        "Failed to delete segment file: {}. Error: {}",
+                        self.filename.display(),
+                        e
+                    );
+                }
+                Ok(_) => {
+                    log::debug!("Segment file deleted: {}", self.filename.display());
+                }
+            }
+        } else {
+            log::debug!("Not deleting segment file: {}", self.filename.display());
+        }
+    }
+}
+
+pub(crate) fn generate_segment<P: AsRef<Path>>(
+    segment_file_path: P,
+    table: &MemTable,
+) -> Result<Segment> {
     assert!(align_of::<SegmentHeader>() <= 8);
 
     let temp_file_path = segment_file_path.as_ref().with_extension("tmp");
@@ -201,9 +263,8 @@ pub fn generate_segment<P: AsRef<Path>>(segment_file_path: P, table: &MemTable) 
     let segment_header = SegmentHeader {
         first_entry: table.get_first_entry(),
         last_entry: table.get_last_entry(),
-        version: SEGMENT_HEADER_VERSION_V1,
-        stream_headers_offset: SEGMENT_HEADER_SIZE,
         stream_headers_count: segment_stream_headers.len() as u64,
+        ..Default::default()
     };
 
     log::debug!(
@@ -291,6 +352,149 @@ pub fn generate_segment<P: AsRef<Path>>(segment_file_path: P, table: &MemTable) 
         file,
         filename: segment_file_path.as_ref().to_path_buf(),
         data: mmap,
+        drop_delete: atomic::AtomicBool::new(false),
+    };
+
+    // rename the file
+
+    Ok(segment)
+}
+
+pub(crate) fn merge_segments(
+    segment_file_path: &path::PathBuf,
+    segments: &[SegmentArc],
+) -> Result<Segment> {
+    assert!(!segments.is_empty(), "No segments to merge");
+
+    assert!(align_of::<SegmentHeader>() <= 8);
+
+    let temp_file_path = segment_file_path.with_extension("tmp");
+
+    let mut file = File::create(&temp_file_path).map_err(errors::new_io_error)?;
+
+    // delete temp file if errors happen
+    let temp_filename_clone = temp_file_path.clone();
+    defer::defer!({
+        // check if the file exists
+        if std::fs::metadata(&temp_filename_clone).is_ok() {
+            // delete the file
+            if std::fs::remove_file(&temp_filename_clone).is_err() {
+                log::warn!("Failed to delete temp file: {:?}", &temp_filename_clone);
+            }
+        }
+    });
+
+    let mut header_map = HashMap::new();
+
+    for segment in segments.iter() {
+        for header in segment.get_stream_headers() {
+            header_map
+                .entry(&header.stream_id)
+                .or_insert_with(|| SegmentStreamHeader {
+                    version: SEGMENT_STREAM_HEADER_VERSION_V1,
+                    offset: header.offset,
+                    stream_id: header.stream_id,
+                    ..Default::default()
+                })
+                .size += header.size;
+        }
+    }
+    let mut segment_stream_headers = header_map
+        .into_iter()
+        .map(|(_, header)| header)
+        .collect::<Vec<SegmentStreamHeader>>();
+
+    segment_stream_headers.sort_by(|a, b| a.stream_id.cmp(&b.stream_id));
+
+    let segment_header = SegmentHeader {
+        level: segments[0].get_segment_header().level + 1,
+        first_entry: segments[0].get_segment_header().first_entry,
+        last_entry: segments.last().unwrap().get_segment_header().last_entry,
+        stream_headers_count: segment_stream_headers.len() as u64,
+        ..Default::default()
+    };
+
+    log::debug!(
+        "Segment {} Header: first_entry: {}, last_entry: {}, stream_headers_count: {}",
+        segment_file_path.display(),
+        segment_header.first_entry,
+        segment_header.last_entry,
+        segment_header.stream_headers_count
+    );
+
+    // Write the segment stream headers to the file
+    file.write_all(unsafe {
+        std::slice::from_raw_parts(
+            &segment_header as *const SegmentHeader as *const u8,
+            SEGMENT_HEADER_SIZE as usize,
+        )
+    })
+    .map_err(errors::new_io_error)?;
+
+    let mut offset = SEGMENT_HEADER_SIZE as u64;
+    offset += SEGMENT_STREAM_HEADER_SIZE as u64 * segment_stream_headers.len() as u64;
+
+    // update the file offset
+    for stream_header in segment_stream_headers.iter_mut() {
+        stream_header.file_offset = offset;
+        offset += stream_header.size;
+    }
+
+    let stream_header = segment_stream_headers.as_ptr() as *const SegmentStreamHeader;
+    let data = unsafe {
+        std::slice::from_raw_parts(
+            stream_header as *const SegmentStreamHeader as *const u8,
+            SEGMENT_STREAM_HEADER_SIZE as usize * segment_stream_headers.len() as usize,
+        )
+    };
+    file.write_all(data).map_err(errors::new_io_error)?;
+
+    // Verify that the segment stream headers are written correctly
+    {
+        let temp_stream_headers = unsafe {
+            std::slice::from_raw_parts(
+                data.as_ptr() as *const SegmentStreamHeader,
+                segment_stream_headers.len(),
+            )
+        };
+        assert!(temp_stream_headers.len() == segment_stream_headers.len());
+        for (i, stream_header) in temp_stream_headers.iter().enumerate() {
+            assert!(stream_header.stream_id == segment_stream_headers[i].stream_id);
+            assert!(stream_header.file_offset == segment_stream_headers[i].file_offset);
+            assert!(stream_header.size == segment_stream_headers[i].size);
+            assert!(stream_header.offset == segment_stream_headers[i].offset);
+            assert!(stream_header.version == segment_stream_headers[i].version);
+            assert!(stream_header.crc_check_sum == segment_stream_headers[i].crc_check_sum);
+        }
+    }
+
+    for header in segment_stream_headers.iter() {
+        for segment in segments.iter() {
+            if let Some(stream_data) = segment.stream_data(header.stream_id) {
+                file.write_all(stream_data).map_err(errors::new_io_error)?;
+            }
+        }
+    }
+
+    // flush the file to disk
+    file.flush().map_err(errors::new_io_error)?;
+    file.sync_all().map_err(errors::new_io_error)?;
+
+    // close the file
+    drop(file);
+
+    // rename the file
+    std::fs::rename(temp_file_path, &segment_file_path).map_err(errors::new_io_error)?;
+
+    // open file with read only
+    let file = File::open(&segment_file_path).map_err(errors::new_io_error)?;
+
+    let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(errors::new_io_error)?;
+    let segment = Segment {
+        file,
+        data: mmap,
+        filename: segment_file_path.to_path_buf(),
+        drop_delete: atomic::AtomicBool::new(false),
     };
 
     // rename the file

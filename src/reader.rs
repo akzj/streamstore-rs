@@ -82,10 +82,7 @@ impl StreamReader {
             .map(|s| s.clone())
         {
             let segments = segments.read().unwrap();
-            let mut index = match segments.binary_search_by(|meta| meta.0.cmp(&self.offset())) {
-                Ok(index) => index + 1,
-                Err(index) => index,
-            };
+            let mut index = match segments.
 
             log::debug!(
                 "Stream ID {} offset {} found in Segment files at index {}",

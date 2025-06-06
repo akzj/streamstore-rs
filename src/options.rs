@@ -8,6 +8,8 @@ pub struct Options {
     pub(crate) max_table_size: u64,
     pub(crate) max_wal_size: u64,
     pub(crate) max_tables_count: u64,
+    pub(crate) segment_merge_count: u64,
+    pub(crate) max_segment_merge_level: u32,
 }
 
 impl Default for Options {
@@ -18,6 +20,8 @@ impl Default for Options {
             max_table_size: 128 * 1024 * 1024,
             max_wal_size: 64 * 1024 * 1024,
             max_tables_count: 10,
+            segment_merge_count: 5,
+            max_segment_merge_level: 5,
         }
     }
 }

@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque, vec_deque},
     fs::{File, OpenOptions},
     io::Seek,
     path::PathBuf,
@@ -16,7 +16,7 @@ use crate::{
     segments::Segment,
 };
 
-pub fn reload_segments(segment_path: &str) -> Result<Vec<Arc<Segment>>> {
+pub fn reload_segments(segment_path: &str) -> Result<VecDeque<Arc<Segment>>> {
     // Check if the segment path exists
     if !std::path::Path::new(segment_path).exists() {
         // create the segment path if it does not exist
@@ -24,7 +24,7 @@ pub fn reload_segments(segment_path: &str) -> Result<Vec<Arc<Segment>>> {
         log::info!("Segment directory created: {}", segment_path);
     }
 
-    let mut segment_files = vec![];
+    let mut segment_files = VecDeque::new();
     for entry in std::fs::read_dir(&segment_path).context("Failed to read segment directory")? {
         let entry = entry.map_err(errors::new_io_error)?;
         if !entry.file_type().map_err(errors::new_io_error)?.is_file() {
@@ -39,10 +39,11 @@ pub fn reload_segments(segment_path: &str) -> Result<Vec<Arc<Segment>>> {
         }
 
         let segment = Segment::open(filename)?;
-        segment_files.push(std::sync::Arc::new(segment));
+        segment_files.push_back(std::sync::Arc::new(segment));
     }
 
     segment_files
+        .make_contiguous()
         .sort_by(|a, b| -> std::cmp::Ordering { a.entry_index().0.cmp(&b.entry_index().0) });
 
     Ok(segment_files)

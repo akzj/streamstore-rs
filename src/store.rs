@@ -1,5 +1,7 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap, VecDeque},
+    ops::ControlFlow,
+    os::unix::thread,
     path,
     rc::Rc,
     sync::{
@@ -7,6 +9,7 @@ use std::{
         atomic::{self, AtomicU64},
         mpsc::{Receiver, SyncSender, sync_channel},
     },
+    thread::sleep,
 };
 
 use anyhow::Result;
@@ -14,12 +17,12 @@ use arc_swap::ArcSwap;
 
 use crate::{
     entry::{AppendEntryResultFn, DataType, Entry},
-    errors::{self, Error, new_stream_not_found, new_stream_offset_invalid},
+    errors::{self, new_stream_not_found},
     mem_table::{GetStreamOffsetFn, MemTable, MemTableArc},
     options::Options,
     reader::StreamReader,
     reload::{self, reload_segments},
-    segments::{Segment, generate_segment},
+    segments::{Segment, generate_segment, merge_segments},
     wal::Wal,
 };
 
@@ -37,10 +40,10 @@ pub struct StreamStoreInner {
 
     pub(crate) table: ArcSwap<MemTable>,
     pub(crate) mem_tables: std::sync::RwLock<Vec<MemTableArc>>,
-    pub(crate) segment_files: RwLock<Vec<SegmentArc>>,
+    pub(crate) segment_files: RwLock<VecDeque<SegmentArc>>,
     pub(crate) offsets: Arc<Mutex<HashMap<u64, u64>>>,
     pub(crate) segment_offset_index:
-        Arc<RwLock<HashMap<u64, Arc<RwLock<Vec<(u64, SegmentWeak)>>>>>>,
+        Arc<RwLock<HashMap<u64, Arc<RwLock<BTreeMap<u64, SegmentWeak>>>>>>,
     pub(crate) is_readonly: Arc<atomic::AtomicBool>,
 }
 
@@ -189,7 +192,7 @@ impl Store {
         if segment_files.is_empty() {
             return Ok(0);
         }
-        let last_segment = segment_files.last().unwrap();
+        let last_segment = segment_files.back().unwrap();
         Ok(last_segment.entry_index().1)
     }
 
@@ -249,6 +252,131 @@ impl Store {
         }
     }
 
+    pub fn merge_segments(&self) -> Result<()> {
+        for level in 0..self.config.max_segment_merge_level {
+            loop {
+                match self.merge_segments_with_level(level) {
+                    Ok(true) => {
+                        log::info!("Merged segments at level {}", level);
+                    }
+                    Ok(false) => {
+                        log::info!("No segments to merge at level {}", level);
+                        break; // No more segments to merge at this level
+                    }
+                    Err(e) => {
+                        log::error!("Failed to merge segments at level {}: {:?}", level, e);
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn merge_segments_with_level(&self, level: u32) -> Result<bool> {
+        let to_merge_segment = match self.segment_files.read().unwrap().iter().try_fold(
+            Vec::new(),
+            |mut acc, segment| {
+                if segment.get_segment_header().level == level {
+                    acc.push(segment.clone());
+                    if acc.len() >= self.config.segment_merge_count as usize {
+                        log::info!("Find to merge {} segments at level {}", acc.len(), level);
+                        return ControlFlow::Break(acc);
+                    }
+                }
+                ControlFlow::Continue(acc)
+            },
+        ) {
+            ControlFlow::Break(segments) => segments,
+            ControlFlow::Continue(_) => {
+                log::info!("No segments to merge at level {}", level);
+                return Ok(false);
+            }
+        };
+
+        // Generate the new segment file name
+        let new_segment_file_name = std::path::Path::new(&self.config.segment_path).join(format!(
+            "{}-{}.seg",
+            to_merge_segment
+                .first()
+                .unwrap()
+                .get_segment_header()
+                .first_entry,
+            to_merge_segment
+                .last()
+                .unwrap()
+                .get_segment_header()
+                .last_entry,
+        ));
+
+        let segment_merged = match merge_segments(&new_segment_file_name, &to_merge_segment) {
+            Ok(segment) => {
+                log::info!(
+                    "Merged {} segments into new segment: {}",
+                    &to_merge_segment
+                        .iter()
+                        .map(|s| s.filename().to_str().unwrap().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    new_segment_file_name.display()
+                );
+                segment
+            }
+            Err(e) => {
+                log::error!("Failed to merge segments: {:?}", e);
+                return Err(e);
+            }
+        };
+
+        // Update the segment files list
+        let mut segment_files_guard = self.segment_files.write().unwrap();
+        segment_files_guard.push_back(Arc::new(segment_merged));
+
+        // Remove the merged segments from the list
+        for segment in to_merge_segment {
+            segment_files_guard.retain(|s| s.filename() != segment.filename());
+            segment.set_drop_delete(true);
+        }
+
+        segment_files_guard
+            .make_contiguous()
+            .sort_by_key(|s| s.entry_index().1);
+
+        log::info!(
+            "Segment merge completed, new segment file: {}",
+            new_segment_file_name.display()
+        );
+
+        // Update the segment offset index
+        return Ok(true);
+    }
+
+    fn run_segment_merger(&self) -> Result<()> {
+        // Start the segment generator thread
+        loop {
+            if self.is_readonly.load(atomic::Ordering::SeqCst) {
+                log::info!("Stop segment merger");
+                break;
+            }
+
+            // Wait for the segment files to be ready
+            sleep(std::time::Duration::from_secs(1));
+
+            match self.merge_segments() {
+                Ok(_) => {
+                    log::info!("Segment merge completed successfully");
+                }
+                Err(e) => {
+                    log::error!("Segment merge failed: {:?}", e);
+                    // If segment merge fails, set the store to readonly
+                    self.is_readonly.store(true, atomic::Ordering::SeqCst);
+                    return Err(e);
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn run_segment_generater(&self) -> Result<()> {
         loop {
             if self.is_readonly.load(atomic::Ordering::SeqCst) {
@@ -291,7 +419,7 @@ impl Store {
             let segment = Arc::new(Segment::open(file_name).unwrap());
 
             let mut segment_files_guard = self.segment_files.write().unwrap();
-            segment_files_guard.push(segment.clone());
+            segment_files_guard.push_back(segment.clone());
 
             for stream_header in segment.get_stream_headers() {
                 let stream_id = stream_header.stream_id;
@@ -300,10 +428,10 @@ impl Store {
                     .write()
                     .unwrap()
                     .entry(stream_id)
-                    .or_insert_with(|| Arc::new(RwLock::new(Vec::new())))
+                    .or_insert_with(|| Arc::new(RwLock::new(BTreeMap::new())))
                     .write()
                     .unwrap()
-                    .push((offset, Arc::downgrade(&segment)));
+                    .insert(offset, Arc::downgrade(&segment));
             }
 
             let mut memtables = self.mem_tables.write().unwrap();
@@ -358,8 +486,11 @@ impl Store {
                     self.table
                         .store(Arc::new(MemTable::new(&get_stream_offset_fn.clone())));
 
-                    let filename = std::path::Path::new(&self.config.segment_path)
-                        .join(format!("{}.seg", table.get_first_entry()));
+                    let filename = std::path::Path::new(&self.config.segment_path).join(format!(
+                        "{}-{}.seg",
+                        table.get_first_entry(),
+                        table.get_last_entry()
+                    ));
                     // notify to create a new segment
                     self.write_segment_sender
                         .send((filename, table.clone()))
@@ -386,7 +517,7 @@ impl Store {
         let mut last_segment_entry_index = 0;
         let mut segment_files = reload_segments(&config.segment_path)?;
         if !segment_files.is_empty() {
-            last_segment_entry_index = segment_files.last().unwrap().entry_index().1;
+            last_segment_entry_index = segment_files.back().unwrap().entry_index().1;
         }
 
         let (mut memtables, files, file) = reload::reload_wals(
@@ -404,20 +535,21 @@ impl Store {
 
             generate_segment(&filename, &table)?;
             let segment = Segment::open(filename)?;
-            segment_files.push(Arc::new(segment));
+            segment_files.push_back(Arc::new(segment));
         }
 
         let mut segment_offset_index = HashMap::new();
         for segment in segment_files.iter() {
+            log::info!("Reloaded segment file: {}", segment.get_segment_header());
             for stream_header in segment.get_stream_headers() {
                 let stream_id = stream_header.stream_id;
                 let offset = stream_header.offset + stream_header.size;
                 segment_offset_index
                     .entry(stream_id)
-                    .or_insert_with(|| Arc::new(RwLock::new(Vec::new())))
+                    .or_insert_with(|| Arc::new(RwLock::new(BTreeMap::new())))
                     .write()
                     .unwrap()
-                    .push((offset, Arc::downgrade(segment)));
+                    .insert(offset, Arc::downgrade(segment));
             }
         }
 
