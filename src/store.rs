@@ -42,8 +42,6 @@ pub struct StreamStoreInner {
     pub(crate) mem_tables: std::sync::RwLock<Vec<MemTableArc>>,
     pub(crate) segment_files: RwLock<VecDeque<SegmentArc>>,
     pub(crate) offsets: Arc<Mutex<HashMap<u64, u64>>>,
-    pub(crate) segment_offset_index:
-        Arc<RwLock<HashMap<u64, Arc<RwLock<BTreeMap<u64, SegmentWeak>>>>>>,
     pub(crate) is_readonly: Arc<atomic::AtomicBool>,
 }
 
@@ -65,6 +63,18 @@ impl StreamStoreInner {
         for segment in segment_files.iter() {
             log::info!("  - {}", segment.filename().display());
         }
+    }
+
+    pub(crate) fn find_segment(&self, stream_id: u64, offset: u64) -> Option<SegmentArc> {
+        self.segment_files
+            .read()
+            .unwrap()
+            .iter()
+            .find(|segment| match segment.get_stream_range(stream_id) {
+                Some((begin, end)) => begin <= offset && offset < end,
+                None => false,
+            })
+            .cloned()
     }
 
     pub fn get_stream_begin(&self, stream_id: u64) -> Result<u64> {
@@ -421,19 +431,6 @@ impl Store {
             let mut segment_files_guard = self.segment_files.write().unwrap();
             segment_files_guard.push_back(segment.clone());
 
-            for stream_header in segment.get_stream_headers() {
-                let stream_id = stream_header.stream_id;
-                let offset = stream_header.offset + stream_header.size;
-                self.segment_offset_index
-                    .write()
-                    .unwrap()
-                    .entry(stream_id)
-                    .or_insert_with(|| Arc::new(RwLock::new(BTreeMap::new())))
-                    .write()
-                    .unwrap()
-                    .insert(offset, Arc::downgrade(&segment));
-            }
-
             let mut memtables = self.mem_tables.write().unwrap();
             if memtables.len() > self.config.max_tables_count as usize {
                 memtables.remove(0);
@@ -538,21 +535,6 @@ impl Store {
             segment_files.push_back(Arc::new(segment));
         }
 
-        let mut segment_offset_index = HashMap::new();
-        for segment in segment_files.iter() {
-            log::info!("Reloaded segment file: {}", segment.get_segment_header());
-            for stream_header in segment.get_stream_headers() {
-                let stream_id = stream_header.stream_id;
-                let offset = stream_header.offset + stream_header.size;
-                segment_offset_index
-                    .entry(stream_id)
-                    .or_insert_with(|| Arc::new(RwLock::new(BTreeMap::new())))
-                    .write()
-                    .unwrap()
-                    .insert(offset, Arc::downgrade(segment));
-            }
-        }
-
         let is_readonly = Arc::new(atomic::AtomicBool::new(false));
         let last_log_entry = memtable.get_last_entry();
 
@@ -594,7 +576,6 @@ impl Store {
             entry_receiver: Mutex::new(entries_receiver),
             write_segment_sender: Arc::new(write_segment_sender),
             write_segment_receiver: Mutex::new(write_segment_receiver),
-            segment_offset_index: Arc::new(RwLock::new(segment_offset_index)),
         };
 
         let store = Store(Arc::new(inner));

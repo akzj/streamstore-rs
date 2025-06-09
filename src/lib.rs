@@ -5,7 +5,6 @@ pub mod options;
 mod reader;
 mod reload;
 mod segments;
-mod offset_index;
 pub mod store;
 mod table;
 mod wal;

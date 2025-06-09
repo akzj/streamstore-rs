@@ -70,7 +70,7 @@ fn main() {
     let crc64 = Crc::<u64>::new(&crc::CRC_64_REDIS);
     let mut hash = crc64.digest();
 
-    let count = 10;
+    let count = 100000;
     for i in 0..count {
         let data = format!("hello world {}\n", i);
         //log::info!("Appending entry: {}", data);
@@ -169,5 +169,5 @@ fn main() {
 
     // log::info!("Stream data: {:?}", String::from_utf8_lossy(&buffer));
 
-    store.merge_segments().unwrap();
+    //store.merge_segments().unwrap();
 }
