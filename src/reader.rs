@@ -2,6 +2,7 @@ use std::{io, ops::ControlFlow, sync::Arc};
 
 use crate::{
     mem_table::MemTableArc,
+    metrics,
     store::{SegmentWeak, StreamStoreInner},
 };
 
@@ -52,6 +53,7 @@ impl StreamReader {
         let mut read_bytes_all = 0;
         if let Some(segment) = &self.read_segment {
             if let Some(segment) = segment.upgrade() {
+                metrics::read_segment_hit_count.inc();
                 let (begin, end) = segment.get_stream_range(self.stream_id).unwrap();
                 assert!(
                     begin <= self.offset() && self.offset() <= end,
@@ -73,10 +75,12 @@ impl StreamReader {
                 }
             }
         }
-
         loop {
+            let begin_ts = std::time::Instant::now();
             match self.inner.find_segment(self.stream_id, self.offset()) {
                 Some(segment) => {
+                    metrics::read_segment_miss_count.inc();
+                    metrics::find_segment_time_seconds.observe(begin_ts.elapsed().as_secs_f64());
                     let bytes_read = segment.read_stream(
                         self.stream_id,
                         self.offset(),
@@ -106,12 +110,6 @@ impl StreamReader {
     }
 
     fn read_from_tables(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        log::info!(
-            "Reading from MemTables for Stream ID {} at offset {}",
-            self.stream_id,
-            self.offset()
-        );
-
         let mut read_bytes_all = 0;
         if let Some(memtable) = &self.read_memtable {
             let bytes_read =

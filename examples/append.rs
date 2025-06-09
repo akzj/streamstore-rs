@@ -29,8 +29,8 @@ fn main() {
     log::info!("Starting streamstore example");
 
     let mut options = streamstore::options::Options::default();
-    options.max_wal_size(1024);
-    options.max_table_size(3000);
+    options.max_wal_size(32 * 1024);
+    options.max_table_size(64 * 1024);
 
     println!("options {:?}", &options);
 
@@ -170,4 +170,6 @@ fn main() {
     // log::info!("Stream data: {:?}", String::from_utf8_lossy(&buffer));
 
     //store.merge_segments().unwrap();
+
+    store.print_metrics();
 }

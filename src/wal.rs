@@ -1,6 +1,7 @@
 use crate::{
     entry::{Encoder, Entry},
     errors::{self},
+    metrics,
 };
 use anyhow::{Context, Error, Result};
 
@@ -47,6 +48,8 @@ impl WalInner {
             "Items must be in order"
         );
         self.try_to_rotate()?;
+
+        let begin_ts = std::time::Instant::now();
         // Append data to the stream
         let mut buffer = Vec::new();
         for item in items {
@@ -69,6 +72,9 @@ impl WalInner {
         }
         // Flush the file to ensure all data is written
         file_guard.flush().map_err(errors::new_io_error)?;
+
+        let elapsed = begin_ts.elapsed();
+        metrics::wal_write_seconds.observe(elapsed.as_secs_f64());
 
         Ok(())
     }
@@ -199,7 +205,6 @@ impl Wal {
         let mut to_removes = vec![];
         let mut wal_files = self.wal_files.lock().unwrap();
         for (id, path) in wal_files.iter() {
-            log::debug!("Checking WAL file: {}, id: {}", path.display(), id);
             if *id <= last_entry_id {
                 // Remove files that are no longer needed
                 if let Err(e) = std::fs::remove_file(path) {
@@ -225,11 +230,13 @@ impl Wal {
 
     pub fn start(&self) -> () {
         // Start the WAL with the given sender
-        let _self = self.clone();
         let _ = thread::Builder::new()
             .name("wals write thread".into())
-            .spawn(move || {
-                _self.run().unwrap();
+            .spawn({
+                let _self = self.clone();
+                move || {
+                    _self.run().unwrap();
+                }
             });
     }
 

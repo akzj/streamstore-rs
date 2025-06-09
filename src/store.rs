@@ -1,3 +1,4 @@
+use core::time;
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     ops::ControlFlow,
@@ -19,6 +20,7 @@ use crate::{
     entry::{AppendEntryResultFn, DataType, Entry},
     errors::{self, new_stream_not_found},
     mem_table::{GetStreamOffsetFn, MemTable, MemTableArc},
+    metrics,
     options::Options,
     reader::StreamReader,
     reload::{self, reload_segments},
@@ -59,9 +61,9 @@ impl StreamStoreInner {
     // print segment files
     pub fn print_segment_files(&self) {
         let segment_files = self.segment_files.read().unwrap();
-        log::info!("Segment files:");
+        log::debug!("Segment files:");
         for segment in segment_files.iter() {
-            log::info!("  - {}", segment.filename().display());
+            log::debug!("  - {}", segment.filename().display());
         }
     }
 
@@ -284,7 +286,7 @@ impl Store {
     }
 
     pub fn merge_segments_with_level(&self, level: u32) -> Result<bool> {
-        let to_merge_segment = match self.segment_files.read().unwrap().iter().try_fold(
+        let to_merges = match self.segment_files.read().unwrap().iter().try_fold(
             Vec::new(),
             |mut acc, segment| {
                 if segment.get_segment_header().level == level {
@@ -304,31 +306,25 @@ impl Store {
             }
         };
 
+        let begin_ts = std::time::Instant::now();
+
         // Generate the new segment file name
-        let new_segment_file_name = std::path::Path::new(&self.config.segment_path).join(format!(
+        let file_name = std::path::Path::new(&self.config.segment_path).join(format!(
             "{}-{}.seg",
-            to_merge_segment
-                .first()
-                .unwrap()
-                .get_segment_header()
-                .first_entry,
-            to_merge_segment
-                .last()
-                .unwrap()
-                .get_segment_header()
-                .last_entry,
+            to_merges.first().unwrap().get_segment_header().first_entry,
+            to_merges.last().unwrap().get_segment_header().last_entry,
         ));
 
-        let segment_merged = match merge_segments(&new_segment_file_name, &to_merge_segment) {
+        let segment = match merge_segments(&file_name, &to_merges) {
             Ok(segment) => {
                 log::info!(
                     "Merged {} segments into new segment: {}",
-                    &to_merge_segment
+                    &to_merges
                         .iter()
                         .map(|s| s.filename().to_str().unwrap().to_string())
                         .collect::<Vec<_>>()
                         .join(", "),
-                    new_segment_file_name.display()
+                    file_name.display()
                 );
                 segment
             }
@@ -340,10 +336,10 @@ impl Store {
 
         // Update the segment files list
         let mut segment_files_guard = self.segment_files.write().unwrap();
-        segment_files_guard.push_back(Arc::new(segment_merged));
+        segment_files_guard.push_back(Arc::new(segment));
 
         // Remove the merged segments from the list
-        for segment in to_merge_segment {
+        for segment in to_merges {
             segment_files_guard.retain(|s| s.filename() != segment.filename());
             segment.set_drop_delete(true);
         }
@@ -353,8 +349,9 @@ impl Store {
             .sort_by_key(|s| s.entry_index().1);
 
         log::info!(
-            "Segment merge completed, new segment file: {}",
-            new_segment_file_name.display()
+            "Segment merge completed, new segment file: {} took {} ms",
+            file_name.display(),
+            begin_ts.elapsed().as_millis()
         );
 
         // Update the segment offset index
@@ -587,20 +584,42 @@ impl Store {
         Ok(store)
     }
 
+    pub fn print_metrics(&self) {
+        println!("{}", metrics::encode_metrics());
+    }
+
+    pub fn get_metrics(&self) -> String {
+        metrics::encode_metrics()
+    }
+
     fn start(&self) -> () {
         self.wal.start();
 
-        let _self = self.clone();
         let _ = std::thread::Builder::new()
             .name("store::run".to_string())
-            .spawn(move || {
-                _self.run();
+            .spawn({
+                let _self = self.clone();
+                move || {
+                    _self.run();
+                }
             });
-        let _self = self.clone();
+
         let _ = std::thread::Builder::new()
             .name("run_segment_generater".to_string())
-            .spawn(move || {
-                _self.run_segment_generater().unwrap();
+            .spawn({
+                let _self = self.clone();
+                move || {
+                    _self.run_segment_generater().unwrap();
+                }
+            });
+
+        let _ = std::thread::Builder::new()
+            .name("run_segment_merger".to_string())
+            .spawn({
+                let _self = self.clone();
+                move || {
+                    _self.run_segment_merger().unwrap();
+                }
             });
     }
 }

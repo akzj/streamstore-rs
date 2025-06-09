@@ -8,4 +8,5 @@ mod segments;
 pub mod store;
 mod table;
 mod wal;
+mod metrics;
 pub use crate::store::Store;
