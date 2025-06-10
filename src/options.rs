@@ -42,6 +42,14 @@ impl Options {
     pub fn new() -> Self {
         Self::default()
     }
+
+    pub fn new_with_data_path(dir: &str) -> Self {
+        let mut options = Self::default();
+        options.wal_path = format!("{}/wal", dir);
+        options.segment_path = format!("{}/segment", dir);
+        options
+    }
+
     pub fn wal_path(&mut self, wal_path: &str) -> &mut Self {
         self.wal_path = wal_path.to_string();
         self

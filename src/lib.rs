@@ -9,4 +9,5 @@ pub mod store;
 mod table;
 mod wal;
 mod metrics;
+mod futures;
 pub use crate::store::Store;

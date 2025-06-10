@@ -19,6 +19,7 @@ use arc_swap::ArcSwap;
 use crate::{
     entry::{AppendEntryResultFn, DataType, Entry},
     errors::{self, new_stream_not_found},
+    futures::AppendFuture,
     mem_table::{GetStreamOffsetFn, MemTable, MemTableArc},
     metrics,
     options::Options,
@@ -178,6 +179,36 @@ impl Store {
             data,
             callback: callback,
         })
+    }
+
+    pub async fn append_async(&self, stream_id: u64, data: DataType) -> Result<u64> {
+        // Check if the store is read-only
+        if self.is_readonly.load(atomic::Ordering::SeqCst) {
+            return Err(errors::new_store_is_read_only());
+        }
+        let id = self
+            .entry_index
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+        let f = AppendFuture::new();
+
+        let result = self.wal.write(Entry {
+            version: 1,
+            id: id,
+            stream_id,
+            data,
+            callback: Some(Box::new({
+                let f = f.clone();
+                move |result| {
+                    f.set_result(result);
+                }
+            })),
+        });
+        if result.is_err() {
+            return Err(result.err().unwrap());
+        }
+        // Wait for the future to complete
+        f.await
     }
 
     pub fn new_stream_reader(&self, stream_id: u64) -> Result<StreamReader> {
