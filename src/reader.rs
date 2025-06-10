@@ -1,4 +1,4 @@
-use std::{io, ops::ControlFlow, sync::Arc};
+use std::{io, sync::Arc};
 
 use crate::{
     mem_table::MemTableArc,

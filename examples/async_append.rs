@@ -1,6 +1,6 @@
 use crc::Crc;
 use std::io::Write;
-use std::{env, io::Read};
+use std::io::Read;
 
 #[tokio::main]
 async fn main() {

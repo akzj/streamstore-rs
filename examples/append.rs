@@ -1,12 +1,11 @@
+use core::time;
 use crc::Crc;
 use std::env;
 use std::io::{Read, Seek, Write};
 use std::sync::{Arc, Condvar, Mutex};
+use std::thread::sleep;
 use streamstore::entry::AppendEntryResultFn;
 fn main() {
-    // Initialize the logger
-    // env_logger::init();
-
     // set rust_log to use the environment variable RUST_LOG
     let log_level = "RUST_LOG";
     let env = env::var(log_level).unwrap_or_else(|_| "debug".to_string());
@@ -172,4 +171,10 @@ fn main() {
     //store.merge_segments().unwrap();
 
     store.print_metrics();
+    drop(reader);
+    drop(store);
+
+    // wait for a while to ensure drop is complete
+    sleep(time::Duration::from_secs(1));
+    log::info!("Example completed successfully");
 }

@@ -5,7 +5,7 @@ use std::{
     fmt::Display,
     fs::File,
     io::{self, Write},
-    path::{self, Path},
+    path::{self},
     sync::atomic,
 };
 
@@ -68,29 +68,20 @@ impl Display for SegmentHeader {
 
 pub struct Segment {
     #[allow(dead_code)]
-    file: File,
     pub filename: path::PathBuf,
-    data: memmap2::Mmap,
+    file: Option<File>,
+    data: Option<memmap2::Mmap>,
     drop_delete: atomic::AtomicBool,
 }
 
 impl Segment {
-    pub fn new(file: File, file_name: path::PathBuf, data: memmap2::Mmap) -> Self {
-        Segment {
-            file,
-            data,
-            filename: file_name,
-            drop_delete: atomic::AtomicBool::new(false),
-        }
-    }
-
-    pub fn open(file_name: path::PathBuf) -> Result<Segment> {
+    pub fn open(file_name: &path::PathBuf) -> Result<Segment> {
         let file = File::open(&file_name).map_err(errors::new_io_error)?;
         let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(errors::new_io_error)?;
         let segment = Segment {
-            file,
-            data: mmap,
-            filename: file_name,
+            file: Some(file),
+            data: Some(mmap),
+            filename: file_name.clone(),
             drop_delete: atomic::AtomicBool::new(false),
         };
         Ok(segment)
@@ -111,16 +102,14 @@ impl Segment {
     }
 
     pub fn get_segment_header(&self) -> SegmentHeader {
-        unsafe { &*(self.data.as_ptr() as *const SegmentHeader) }.clone()
+        unsafe { &*(self.data() as *const SegmentHeader) }.clone()
     }
 
     pub fn get_stream_headers(&self) -> &[SegmentStreamHeader] {
         let header = self.get_segment_header();
         unsafe {
             std::slice::from_raw_parts(
-                self.data
-                    .as_ptr()
-                    .add(header.stream_headers_offset as usize)
+                self.data().add(header.stream_headers_offset as usize)
                     as *const SegmentStreamHeader,
                 header.stream_headers_count as usize,
             )
@@ -149,6 +138,10 @@ impl Segment {
             .map(|index| self.get_stream_headers()[index].clone())
     }
 
+    fn data(&self) -> *const u8 {
+        self.data.as_ref().unwrap().as_ptr()
+    }
+
     pub fn read_stream(&self, stream_id: u64, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
         let stream_header = self.find_stream_header(stream_id);
         return match stream_header {
@@ -158,7 +151,7 @@ impl Segment {
                 {
                     let stream_data = unsafe {
                         std::slice::from_raw_parts(
-                            self.data.as_ptr().add(stream_header.file_offset as usize) as *const u8,
+                            self.data().add(stream_header.file_offset as usize) as *const u8,
                             stream_header.size as usize,
                         )
                     };
@@ -190,10 +183,7 @@ impl Segment {
         let size = stream_header.size;
 
         let data = unsafe {
-            std::slice::from_raw_parts(
-                self.data.as_ptr().add(offset as usize) as *const u8,
-                size as usize,
-            )
+            std::slice::from_raw_parts(self.data().add(offset as usize) as *const u8, size as usize)
         };
         Some(data)
     }
@@ -203,6 +193,11 @@ impl Drop for Segment {
     fn drop(&mut self) {
         if self.drop_delete.load(atomic::Ordering::Relaxed) {
             log::debug!("Deleting segment file: {}", self.filename.display());
+
+            // Ensure the file and data are properly released
+            self.data.take();
+            self.file.take();
+
             match std::fs::remove_file(&self.filename) {
                 Err(e) => {
                     log::warn!(
@@ -221,14 +216,16 @@ impl Drop for Segment {
     }
 }
 
-pub(crate) fn generate_segment<P: AsRef<Path>>(
-    segment_file_path: P,
+unsafe impl Send for Segment {}
+unsafe impl Sync for Segment {}
+
+pub(crate) fn generate_segment(
+    segment_file_path: &path::PathBuf,
     table: &MemTable,
 ) -> Result<Segment> {
     assert!(align_of::<SegmentHeader>() <= 8);
 
-    let temp_file_path = segment_file_path.as_ref().with_extension("tmp");
-
+    let temp_file_path = segment_file_path.with_extension("tmp");
     let mut file = File::create(&temp_file_path).map_err(errors::new_io_error)?;
 
     let mut segment_stream_headers = Vec::new();
@@ -270,7 +267,7 @@ pub(crate) fn generate_segment<P: AsRef<Path>>(
 
     log::debug!(
         "Segment {} Header: first_entry: {}, last_entry: {}, stream_headers_count: {}",
-        segment_file_path.as_ref().display(),
+        segment_file_path.display(),
         segment_header.first_entry,
         segment_header.last_entry,
         segment_header.stream_headers_count
@@ -343,22 +340,9 @@ pub(crate) fn generate_segment<P: AsRef<Path>>(
     drop(file);
 
     // rename the file
-    std::fs::rename(temp_file_path, &segment_file_path).map_err(errors::new_io_error)?;
+    std::fs::rename(temp_file_path, segment_file_path).map_err(errors::new_io_error)?;
 
-    // open file with read only
-    let file = File::open(&segment_file_path).map_err(errors::new_io_error)?;
-
-    let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(errors::new_io_error)?;
-    let segment = Segment {
-        file,
-        filename: segment_file_path.as_ref().to_path_buf(),
-        data: mmap,
-        drop_delete: atomic::AtomicBool::new(false),
-    };
-
-    // rename the file
-
-    Ok(segment)
+    Ok(Segment::open(segment_file_path)?)
 }
 
 pub(crate) fn merge_segments(
@@ -486,21 +470,7 @@ pub(crate) fn merge_segments(
 
     // rename the file
     std::fs::rename(temp_file_path, &segment_file_path).map_err(errors::new_io_error)?;
-
-    // open file with read only
-    let file = File::open(&segment_file_path).map_err(errors::new_io_error)?;
-
-    let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(errors::new_io_error)?;
-    let segment = Segment {
-        file,
-        data: mmap,
-        filename: segment_file_path.to_path_buf(),
-        drop_delete: atomic::AtomicBool::new(false),
-    };
-
-    // rename the file
-
-    Ok(segment)
+    Ok(Segment::open(&segment_file_path)?)
 }
 
 #[test]

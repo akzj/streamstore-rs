@@ -6,14 +6,11 @@ pub struct AppendFutureInner {
     result: Option<Result<u64>>,
     waker: Option<std::task::Waker>,
 }
-
 // AppendFuture is a future that resolves when an append operation is complete.
 pub struct AppendFuture(Arc<Mutex<AppendFutureInner>>);
-
 // Define Deref for AppendFuture to access the inner state.
 impl std::ops::Deref for AppendFuture {
     type Target = Mutex<AppendFutureInner>;
-
     fn deref(&self) -> &Self::Target {
         &self.0
     }

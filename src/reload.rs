@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use std::{
-    collections::{HashMap, VecDeque, vec_deque},
+    collections::{HashMap, VecDeque},
     fs::{File, OpenOptions},
     io::Seek,
     path::PathBuf,
@@ -38,7 +38,7 @@ pub fn reload_segments(segment_path: &str) -> Result<VecDeque<Arc<Segment>>> {
             continue;
         }
 
-        let segment = Segment::open(filename)?;
+        let segment = Segment::open(&filename)?;
         segment_files.push_back(std::sync::Arc::new(segment));
     }
 

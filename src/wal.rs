@@ -6,6 +6,7 @@ use crate::{
 use anyhow::{Context, Error, Result};
 
 use std::{
+    cell::RefCell,
     collections::HashMap,
     fs::File,
     io::Write,
@@ -23,24 +24,13 @@ pub struct WalInner {
     max_size: u64,
     file_size: atomic::AtomicU64,
     last_entry: atomic::AtomicU64,
-    sender: SyncSender<Entry>,
-    next: SyncSender<Vec<Entry>>,
+    next: RefCell<Option<SyncSender<Vec<Entry>>>>,
     receiver: Mutex<Receiver<Entry>>,
     wal_files: Mutex<HashMap<u64, PathBuf>>,
     err_handler: std::sync::Mutex<Box<dyn Fn(anyhow::Error) + Send + Sync>>,
 }
 
 impl WalInner {
-    pub fn close(&mut self) -> Result<()> {
-        // Close the WAL file
-        self.file
-            .lock()
-            .unwrap()
-            .sync_all()
-            .map_err(errors::new_io_error)?;
-        Ok(())
-    }
-
     pub fn batch_write(&self, items: &[Entry]) -> Result<()> {
         assert!(!items.is_empty(), "Items cannot be empty");
         assert!(
@@ -112,90 +102,6 @@ impl WalInner {
         Ok(())
     }
 
-    pub fn run(&self) -> Result<()> {
-        // Start the WAL thread
-        loop {
-            let item = self.receiver.lock().unwrap().recv().unwrap();
-
-            let mut items = vec![item];
-            loop {
-                match self.receiver.lock().unwrap().try_recv() {
-                    Ok(item) => {
-                        items.push(item);
-                        if items.len() >= 128 {
-                            break;
-                        }
-                    }
-                    Err(_) => {
-                        break;
-                    }
-                }
-            }
-            // Write the items to the file
-            match self.batch_write(&items) {
-                Ok(_) => {}
-                Err(e) => {
-                    // Handle the error
-                    self.err_handler.lock().unwrap()(e);
-                    //log.warn!("Error writing to WAL: {:?}", e);
-                }
-            }
-
-            match self.next.send(items) {
-                Ok(_) => {}
-                Err(e) => {
-                    // Handle the error
-                    println!("Error sending to next: {:?}", e);
-                    self.err_handler.lock().unwrap()(anyhow::anyhow!(
-                        "Error sending to next: {:?}",
-                        e
-                    ));
-                }
-            }
-        }
-    }
-}
-
-unsafe impl Sync for WalInner {}
-unsafe impl Send for WalInner {}
-
-#[derive(Clone)]
-pub struct Wal(Arc<WalInner>);
-
-impl std::ops::Deref for Wal {
-    type Target = WalInner;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl Wal {
-    pub fn new(
-        file: File,
-        dir: String,
-        max_size: u64,
-        last_entry: u64,
-        next: SyncSender<Vec<Entry>>,
-        wal_files: HashMap<u64, PathBuf>,
-        err_handler: Box<dyn Fn(Error) + Send + Sync>,
-    ) -> Self {
-        let (sender, receiver) = std::sync::mpsc::sync_channel(1024);
-        let file_size = file.metadata().expect("Failed to get file metadata").len();
-        Wal(Arc::new(WalInner {
-            dir,
-            next,
-            sender,
-            max_size,
-            wal_files: Mutex::new(wal_files),
-            file: Mutex::new(file),
-            receiver: Mutex::new(receiver),
-            last_entry: atomic::AtomicU64::new(last_entry),
-            file_size: atomic::AtomicU64::new(file_size),
-            err_handler: std::sync::Mutex::new(err_handler),
-        }))
-    }
-
     pub fn gc(&self, last_entry_id: u64) -> Result<()> {
         log::info!(
             "Performing garbage collection on WAL files, last_entry_id: {}",
@@ -222,6 +128,110 @@ impl Wal {
         Ok(())
     }
 
+    pub fn drop_next_sender(&self) {
+        self.next.borrow_mut().take();
+    }
+
+    pub fn run(&self) -> Result<()> {
+        // Start the WAL thread
+        loop {
+            let item = match self.receiver.lock().unwrap().recv() {
+                Ok(item) => item,
+                Err(e) => {
+                    log::info!("senders are dropped");
+                    self.drop_next_sender();
+                    return Ok(());
+                }
+            };
+
+            let mut items = vec![item];
+            loop {
+                match self.receiver.lock().unwrap().try_recv() {
+                    Ok(item) => {
+                        items.push(item);
+                        if items.len() >= 128 {
+                            break;
+                        }
+                    }
+                    Err(_) => {
+                        break;
+                    }
+                }
+            }
+            // Write the items to the file
+            match self.batch_write(&items) {
+                Ok(_) => {}
+                Err(e) => {
+                    // Handle the error
+                    self.err_handler.lock().unwrap()(e);
+                    //log.warn!("Error writing to WAL: {:?}", e);
+                }
+            }
+
+            match self.next.borrow().as_ref().unwrap().send(items) {
+                Ok(_) => {}
+                Err(e) => {
+                    // Handle the error
+                    println!("Error sending to next: {:?}", e);
+                    self.err_handler.lock().unwrap()(anyhow::anyhow!(
+                        "Error sending to next: {:?}",
+                        e
+                    ));
+                }
+            }
+        }
+    }
+}
+
+unsafe impl Sync for WalInner {}
+unsafe impl Send for WalInner {}
+
+#[derive(Clone)]
+pub struct Wal {
+    inner: Arc<WalInner>,
+    sender: SyncSender<Entry>,
+}
+
+impl std::ops::Deref for Wal {
+    type Target = WalInner;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl Wal {
+    pub fn new(
+        file: File,
+        dir: String,
+        max_size: u64,
+        last_entry: u64,
+        next: SyncSender<Vec<Entry>>,
+        wal_files: HashMap<u64, PathBuf>,
+        err_handler: Box<dyn Fn(Error) + Send + Sync>,
+    ) -> Self {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1024);
+        let file_size = file.metadata().expect("Failed to get file metadata").len();
+        Wal {
+            inner: Arc::new(WalInner {
+                dir,
+                max_size,
+                file: Mutex::new(file),
+                next: RefCell::new(Some(next)),
+                wal_files: Mutex::new(wal_files),
+                receiver: Mutex::new(receiver),
+                last_entry: atomic::AtomicU64::new(last_entry),
+                file_size: atomic::AtomicU64::new(file_size),
+                err_handler: std::sync::Mutex::new(err_handler),
+            }),
+            sender: sender,
+        }
+    }
+
+    pub fn clone_inner(&self) -> Arc<WalInner> {
+        self.inner.clone()
+    }
+
     pub fn write(&self, item: Entry) -> Result<()> {
         // Append data to the stream
         self.sender.send(item).context("wal sender error")?;
@@ -233,9 +243,13 @@ impl Wal {
         let _ = thread::Builder::new()
             .name("wals write thread".into())
             .spawn({
-                let _self = self.clone();
+                let _self = self.inner.clone();
                 move || {
-                    _self.run().unwrap();
+                    _self.run().unwrap_or_else(|e| {
+                        log::error!("WAL thread encountered an error: {:?}", e);
+                        // Call the error handler if set
+                        _self.err_handler.lock().unwrap()(e);
+                    })
                 }
             });
     }
@@ -247,5 +261,12 @@ impl Wal {
         // Set the error handler
         *self.err_handler.lock().unwrap() = err_handler;
         Ok(())
+    }
+}
+
+impl Drop for Wal {
+    fn drop(&mut self) {
+        // Close the WAL file
+        log::info!("Dropping WAL, closing sender channel");
     }
 }

@@ -1,16 +1,13 @@
-use core::time;
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{HashMap, VecDeque},
     ops::ControlFlow,
-    os::unix::thread,
     path,
     rc::Rc,
     sync::{
-        Arc, Mutex, RwLock, Weak,
+        Arc, Condvar, Mutex, RwLock, Weak,
         atomic::{self, AtomicU64},
         mpsc::{Receiver, SyncSender, sync_channel},
     },
-    thread::sleep,
 };
 
 use anyhow::Result;
@@ -21,12 +18,12 @@ use crate::{
     errors::{self, new_stream_not_found},
     futures::AppendFuture,
     mem_table::{GetStreamOffsetFn, MemTable, MemTableArc},
-    metrics,
+    metrics::{self},
     options::Options,
     reader::StreamReader,
     reload::{self, reload_segments},
     segments::{Segment, generate_segment, merge_segments},
-    wal::Wal,
+    wal::{Wal, WalInner},
 };
 
 pub(crate) type SegmentArc = Arc<Segment>;
@@ -34,12 +31,10 @@ pub(crate) type SegmentWeak = Weak<Segment>;
 
 pub struct StreamStoreInner {
     // segment files
-    wal: Wal,
+    wal_inner: Arc<WalInner>,
     config: Options,
     entry_index: AtomicU64,
-    write_segment_receiver: Mutex<Receiver<(path::PathBuf, MemTableArc)>>,
     entry_receiver: Mutex<Receiver<Vec<Entry>>>,
-    write_segment_sender: Arc<SyncSender<(path::PathBuf, MemTableArc)>>,
 
     pub(crate) table: ArcSwap<MemTable>,
     pub(crate) mem_tables: std::sync::RwLock<Vec<MemTableArc>>,
@@ -49,12 +44,15 @@ pub struct StreamStoreInner {
 }
 
 #[derive(Clone)]
-pub struct Store(Arc<StreamStoreInner>);
+pub struct Store {
+    inner: Arc<StreamStoreInner>,
+    wal: Arc<Wal>,
+}
 
 impl std::ops::Deref for Store {
     type Target = StreamStoreInner;
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.inner
     }
 }
 
@@ -145,6 +143,251 @@ impl StreamStoreInner {
         return Ok(end.unwrap());
     }
 
+    fn memtable_writer(
+        &self,
+        write_segment_sender: SyncSender<(path::PathBuf, MemTableArc)>,
+    ) -> () {
+        let get_stream_offset_fn: GetStreamOffsetFn = Arc::new(Box::new({
+            let offsets = self.offsets.clone();
+            move |stream_id| match offsets.lock().unwrap().get(&stream_id) {
+                Some(offset) => Ok(*offset),
+                None => Ok(0), // Default to 0 if not found
+            }
+        }));
+
+        loop {
+            let entries = match self.entry_receiver.lock().unwrap().recv() {
+                Ok(entries) => entries,
+                Err(_) => {
+                    log::info!("Entry receiver closed, exiting memtable writer");
+                    self.is_readonly.store(true, atomic::Ordering::SeqCst);
+                    break;
+                }
+            };
+
+            for entry in entries {
+                let table = self.table.load();
+                // Append the memory table
+                match table.append(&entry) {
+                    Ok(offset) => {
+                        self.offsets.lock().unwrap().insert(entry.stream_id, offset);
+                        match entry.callback {
+                            Some(callback) => {
+                                callback(Ok(offset));
+                            }
+                            None => {}
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("Failed to append entry: {:?}", e);
+                        return;
+                    }
+                }
+
+                // Check if the table size is greater than the max size
+                if table.get_size() > self.config.max_table_size {
+                    self.mem_tables.write().unwrap().push(table.clone());
+                    self.table
+                        .store(Arc::new(MemTable::new(&get_stream_offset_fn.clone())));
+
+                    let filename = std::path::Path::new(&self.config.segment_path).join(format!(
+                        "{}-{}.seg",
+                        table.get_first_entry(),
+                        table.get_last_entry()
+                    ));
+                    // notify to create a new segment
+                    write_segment_sender
+                        .send((filename, table.clone()))
+                        .unwrap();
+                    // Reset the memory table
+                }
+            }
+        }
+    }
+
+    fn run_segment_generater(
+        &self,
+        receiver: Receiver<(path::PathBuf, MemTableArc)>,
+    ) -> Result<()> {
+        loop {
+            if self.is_readonly.load(atomic::Ordering::SeqCst) {
+                log::info!("Stop segment generator");
+                break;
+            }
+            let (file_name, table) = match receiver.recv() {
+                Ok((file_name, table)) => (file_name, table),
+                Err(_) => {
+                    log::info!("Segment generator receiver closed, exiting segment generator");
+                    return Ok(());
+                }
+            };
+            match generate_segment(&file_name, &table) {
+                Ok(_) => {
+                    log::info!("Segment generated: {}", file_name.display());
+                    match self.wal_inner.gc(table.get_last_entry()) {
+                        Ok(_) => {
+                            log::info!(
+                                "WAL garbage collection completed for segment: {}",
+                                file_name.display()
+                            );
+                        }
+                        Err(e) => {
+                            log::error!("Failed to garbage collect WAL: {:?}", e);
+                            // If WAL garbage collection fails, set the store to readonly
+                            self.is_readonly.store(true, atomic::Ordering::SeqCst);
+                            return Err(e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    // If segment generation fails, set the store to readonly
+                    self.is_readonly.store(true, atomic::Ordering::SeqCst);
+                    log::error!(
+                        "Failed to generate segment {}: {:?}",
+                        file_name.display(),
+                        e
+                    );
+                    return Err(e);
+                }
+            }
+            // update segment list
+            let segment = Arc::new(Segment::open(&file_name).unwrap());
+
+            let mut segment_files_guard = self.segment_files.write().unwrap();
+            segment_files_guard.push_back(segment.clone());
+
+            let mut memtables = self.mem_tables.write().unwrap();
+            if memtables.len() > self.config.max_tables_count as usize {
+                memtables.remove(0);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn merge_segments(&self) -> Result<()> {
+        for level in 0..self.config.max_segment_merge_level {
+            loop {
+                match self.merge_segments_with_level(level) {
+                    Ok(true) => {
+                        log::info!("Merged segments at level {}", level);
+                    }
+                    Ok(false) => {
+                        // log::info!("No segments to merge at level {}", level);
+                        break; // No more segments to merge at this level
+                    }
+                    Err(e) => {
+                        log::error!("Failed to merge segments at level {}: {:?}", level, e);
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn merge_segments_with_level(&self, level: u32) -> Result<bool> {
+        let to_merges = match self.segment_files.read().unwrap().iter().try_fold(
+            Vec::new(),
+            |mut acc, segment| {
+                if segment.get_segment_header().level == level {
+                    acc.push(segment.clone());
+                    if acc.len() >= self.config.segment_merge_count as usize {
+                        log::info!("Find to merge {} segments at level {}", acc.len(), level);
+                        return ControlFlow::Break(acc);
+                    }
+                }
+                ControlFlow::Continue(acc)
+            },
+        ) {
+            ControlFlow::Break(segments) => segments,
+            ControlFlow::Continue(_) => {
+                // log::info!("No segments to merge at level {}", level);
+                return Ok(false);
+            }
+        };
+
+        let begin_ts = std::time::Instant::now();
+
+        // Generate the new segment file name
+        let file_name = std::path::Path::new(&self.config.segment_path).join(format!(
+            "{}-{}.seg",
+            to_merges.first().unwrap().get_segment_header().first_entry,
+            to_merges.last().unwrap().get_segment_header().last_entry,
+        ));
+
+        let segment = match merge_segments(&file_name, &to_merges) {
+            Ok(segment) => {
+                log::info!(
+                    "Merged {} segments into new segment: {}",
+                    &to_merges
+                        .iter()
+                        .map(|s| s.filename().to_str().unwrap().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    file_name.display()
+                );
+                segment
+            }
+            Err(e) => {
+                log::error!("Failed to merge segments: {:?}", e);
+                return Err(e);
+            }
+        };
+
+        // Update the segment files list
+        let mut segment_files_guard = self.segment_files.write().unwrap();
+        segment_files_guard.push_back(Arc::new(segment));
+
+        // Remove the merged segments from the list
+        for segment in to_merges {
+            segment_files_guard.retain(|s| s.filename() != segment.filename());
+            segment.set_drop_delete(true);
+        }
+
+        segment_files_guard
+            .make_contiguous()
+            .sort_by_key(|s| s.entry_index().1);
+
+        log::info!(
+            "Segment merge completed, new segment file: {} took {} ms",
+            file_name.display(),
+            begin_ts.elapsed().as_millis()
+        );
+
+        // Update the segment offset index
+        return Ok(true);
+    }
+
+    // Start the segment generator thread
+    fn run_segment_merger(&self, stop_cond: Arc<(Mutex<u64>, Condvar)>) -> Result<()> {
+        loop {
+            let result = stop_cond
+                .1
+                .wait_timeout(
+                    stop_cond.0.lock().unwrap(),
+                    std::time::Duration::from_secs(1),
+                )
+                .unwrap();
+            if result.1.timed_out() == false {
+                log::info!("Segment merger stopped by condition variable");
+                break;
+            }
+
+            match self.merge_segments() {
+                Ok(_) => {
+                    // log::info!("Segment merge completed successfully");
+                }
+                Err(e) => {
+                    log::error!("Segment merge failed: {:?}", e);
+                    // If segment merge fails, set the store to readonly
+                    self.is_readonly.store(true, atomic::Ordering::SeqCst);
+                    return Err(e);
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn get_stream_range(&self, stream_id: u64) -> Result<(u64, u64)> {
         let res = self.get_stream_begin(stream_id);
         match res {
@@ -214,20 +457,20 @@ impl Store {
     pub fn new_stream_reader(&self, stream_id: u64) -> Result<StreamReader> {
         self.offsets.lock().unwrap().get(&stream_id).map_or_else(
             || Err(new_stream_not_found(stream_id)),
-            |_offset| Ok(StreamReader::new(self.0.clone(), stream_id)),
+            |_offset| Ok(StreamReader::new(self.inner.clone(), stream_id)),
         )
     }
 
     pub fn get_stream_end(&self, stream_id: u64) -> Result<u64> {
-        self.0.get_stream_end(stream_id)
+        self.inner.get_stream_end(stream_id)
     }
 
     pub fn get_stream_begin(&self, stream_id: u64) -> Result<u64> {
-        self.0.get_stream_begin(stream_id)
+        self.inner.get_stream_begin(stream_id)
     }
 
     pub fn get_stream_range(&self, stream_id: u64) -> Result<(u64, u64)> {
-        self.0.get_stream_range(stream_id)
+        self.inner.get_stream_range(stream_id)
     }
 
     #[allow(dead_code)]
@@ -296,237 +539,6 @@ impl Store {
         }
     }
 
-    pub fn merge_segments(&self) -> Result<()> {
-        for level in 0..self.config.max_segment_merge_level {
-            loop {
-                match self.merge_segments_with_level(level) {
-                    Ok(true) => {
-                        log::info!("Merged segments at level {}", level);
-                    }
-                    Ok(false) => {
-                        log::info!("No segments to merge at level {}", level);
-                        break; // No more segments to merge at this level
-                    }
-                    Err(e) => {
-                        log::error!("Failed to merge segments at level {}: {:?}", level, e);
-                        return Err(e);
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    pub fn merge_segments_with_level(&self, level: u32) -> Result<bool> {
-        let to_merges = match self.segment_files.read().unwrap().iter().try_fold(
-            Vec::new(),
-            |mut acc, segment| {
-                if segment.get_segment_header().level == level {
-                    acc.push(segment.clone());
-                    if acc.len() >= self.config.segment_merge_count as usize {
-                        log::info!("Find to merge {} segments at level {}", acc.len(), level);
-                        return ControlFlow::Break(acc);
-                    }
-                }
-                ControlFlow::Continue(acc)
-            },
-        ) {
-            ControlFlow::Break(segments) => segments,
-            ControlFlow::Continue(_) => {
-                log::info!("No segments to merge at level {}", level);
-                return Ok(false);
-            }
-        };
-
-        let begin_ts = std::time::Instant::now();
-
-        // Generate the new segment file name
-        let file_name = std::path::Path::new(&self.config.segment_path).join(format!(
-            "{}-{}.seg",
-            to_merges.first().unwrap().get_segment_header().first_entry,
-            to_merges.last().unwrap().get_segment_header().last_entry,
-        ));
-
-        let segment = match merge_segments(&file_name, &to_merges) {
-            Ok(segment) => {
-                log::info!(
-                    "Merged {} segments into new segment: {}",
-                    &to_merges
-                        .iter()
-                        .map(|s| s.filename().to_str().unwrap().to_string())
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    file_name.display()
-                );
-                segment
-            }
-            Err(e) => {
-                log::error!("Failed to merge segments: {:?}", e);
-                return Err(e);
-            }
-        };
-
-        // Update the segment files list
-        let mut segment_files_guard = self.segment_files.write().unwrap();
-        segment_files_guard.push_back(Arc::new(segment));
-
-        // Remove the merged segments from the list
-        for segment in to_merges {
-            segment_files_guard.retain(|s| s.filename() != segment.filename());
-            segment.set_drop_delete(true);
-        }
-
-        segment_files_guard
-            .make_contiguous()
-            .sort_by_key(|s| s.entry_index().1);
-
-        log::info!(
-            "Segment merge completed, new segment file: {} took {} ms",
-            file_name.display(),
-            begin_ts.elapsed().as_millis()
-        );
-
-        // Update the segment offset index
-        return Ok(true);
-    }
-
-    fn run_segment_merger(&self) -> Result<()> {
-        // Start the segment generator thread
-        loop {
-            if self.is_readonly.load(atomic::Ordering::SeqCst) {
-                log::info!("Stop segment merger");
-                break;
-            }
-
-            // Wait for the segment files to be ready
-            sleep(std::time::Duration::from_secs(1));
-
-            match self.merge_segments() {
-                Ok(_) => {
-                    log::info!("Segment merge completed successfully");
-                }
-                Err(e) => {
-                    log::error!("Segment merge failed: {:?}", e);
-                    // If segment merge fails, set the store to readonly
-                    self.is_readonly.store(true, atomic::Ordering::SeqCst);
-                    return Err(e);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn run_segment_generater(&self) -> Result<()> {
-        loop {
-            if self.is_readonly.load(atomic::Ordering::SeqCst) {
-                log::info!("Stop segment generator");
-                break;
-            }
-
-            let write_segment_receiver = self.write_segment_receiver.lock().unwrap();
-            let (file_name, table) = write_segment_receiver.recv().unwrap();
-            match generate_segment(&file_name, &table) {
-                Ok(_) => {
-                    log::info!("Segment generated: {}", file_name.display());
-                    match self.wal.gc(table.get_last_entry()) {
-                        Ok(_) => {
-                            log::info!(
-                                "WAL garbage collection completed for segment: {}",
-                                file_name.display()
-                            );
-                        }
-                        Err(e) => {
-                            log::error!("Failed to garbage collect WAL: {:?}", e);
-                            // If WAL garbage collection fails, set the store to readonly
-                            self.is_readonly.store(true, atomic::Ordering::SeqCst);
-                            return Err(e);
-                        }
-                    }
-                }
-                Err(e) => {
-                    // If segment generation fails, set the store to readonly
-                    self.is_readonly.store(true, atomic::Ordering::SeqCst);
-                    log::error!(
-                        "Failed to generate segment {}: {:?}",
-                        file_name.display(),
-                        e
-                    );
-                    return Err(e);
-                }
-            }
-            // update segment list
-            let segment = Arc::new(Segment::open(file_name).unwrap());
-
-            let mut segment_files_guard = self.segment_files.write().unwrap();
-            segment_files_guard.push_back(segment.clone());
-
-            let mut memtables = self.mem_tables.write().unwrap();
-            if memtables.len() > self.config.max_tables_count as usize {
-                memtables.remove(0);
-            }
-        }
-        Ok(())
-    }
-
-    fn run(&self) -> () {
-        let get_stream_offset_fn: GetStreamOffsetFn = Arc::new(Box::new({
-            let offsets = self.offsets.clone();
-            move |stream_id| match offsets.lock().unwrap().get(&stream_id) {
-                Some(offset) => Ok(*offset),
-                None => Ok(0), // Default to 0 if not found
-            }
-        }));
-
-        loop {
-            let entries = self.entry_receiver.lock().unwrap().recv();
-            if entries.is_err() {
-                log::info!(
-                    "error {} happen commit entry loop exit",
-                    entries.err().unwrap()
-                );
-                break;
-            }
-
-            for entry in entries.unwrap() {
-                let table = self.table.load();
-                // Append the memory table
-                match table.append(&entry) {
-                    Ok(offset) => {
-                        self.offsets.lock().unwrap().insert(entry.stream_id, offset);
-                        match entry.callback {
-                            Some(callback) => {
-                                callback(Ok(offset));
-                            }
-                            None => {}
-                        }
-                    }
-                    Err(e) => {
-                        log::error!("Failed to append entry: {:?}", e);
-                        return;
-                    }
-                }
-
-                // Check if the table size is greater than the max size
-                if table.get_size() > self.config.max_table_size {
-                    self.mem_tables.write().unwrap().push(table.clone());
-                    self.table
-                        .store(Arc::new(MemTable::new(&get_stream_offset_fn.clone())));
-
-                    let filename = std::path::Path::new(&self.config.segment_path).join(format!(
-                        "{}-{}.seg",
-                        table.get_first_entry(),
-                        table.get_last_entry()
-                    ));
-                    // notify to create a new segment
-                    self.write_segment_sender
-                        .send((filename, table.clone()))
-                        .unwrap();
-                    // Reset the memory table
-                }
-            }
-        }
-    }
-
     pub fn reload(config: &Options) -> Result<Self> {
         let offset_map = Arc::new(Mutex::new(HashMap::new()));
 
@@ -560,7 +572,7 @@ impl Store {
                 .join(format!("{}.seg", table.get_first_entry()));
 
             generate_segment(&filename, &table)?;
-            let segment = Segment::open(filename)?;
+            let segment = Segment::open(&filename)?;
             segment_files.push_back(Arc::new(segment));
         }
 
@@ -587,14 +599,11 @@ impl Store {
 
         log::info!("last log entry: {}", last_log_entry);
 
-        let (write_segment_sender, write_segment_receiver) =
-            sync_channel::<(path::PathBuf, MemTableArc)>(10);
-
         // unwrap the Rc to get the inner memtable
         let memtable = Rc::into_inner(memtable).unwrap();
 
         let inner = StreamStoreInner {
-            wal: wal,
+            wal_inner: wal.clone_inner(),
             config: config.clone(),
             offsets: offset_map.clone(),
             is_readonly: is_readonly.clone(),
@@ -603,11 +612,12 @@ impl Store {
             mem_tables: RwLock::new(Vec::new()),
             segment_files: RwLock::new(segment_files),
             entry_receiver: Mutex::new(entries_receiver),
-            write_segment_sender: Arc::new(write_segment_sender),
-            write_segment_receiver: Mutex::new(write_segment_receiver),
         };
 
-        let store = Store(Arc::new(inner));
+        let store = Store {
+            inner: Arc::new(inner),
+            wal: Arc::new(wal),
+        };
 
         store.reload_offset();
         // start background thread
@@ -627,31 +637,44 @@ impl Store {
     fn start(&self) -> () {
         self.wal.start();
 
+        let (sender, receiver) = sync_channel::<(path::PathBuf, MemTableArc)>(10);
+        let cond = Arc::new((Mutex::new(0 as u64), Condvar::new()));
+
         let _ = std::thread::Builder::new()
             .name("store::run".to_string())
             .spawn({
-                let _self = self.clone();
+                let _self = self.inner.clone();
+                let cond = cond.clone();
                 move || {
-                    _self.run();
+                    _self.memtable_writer(sender);
+                    cond.1.notify_all();
                 }
             });
 
         let _ = std::thread::Builder::new()
             .name("run_segment_generater".to_string())
             .spawn({
-                let _self = self.clone();
+                let _self = self.inner.clone();
                 move || {
-                    _self.run_segment_generater().unwrap();
+                    _self.run_segment_generater(receiver).unwrap();
                 }
             });
 
         let _ = std::thread::Builder::new()
             .name("run_segment_merger".to_string())
             .spawn({
-                let _self = self.clone();
+                let _self = self.inner.clone();
                 move || {
-                    _self.run_segment_merger().unwrap();
+                    _self.run_segment_merger(cond).unwrap();
                 }
             });
+    }
+}
+
+impl Drop for Store {
+    fn drop(&mut self) {
+        log::info!("Dropping Store");
+        // Set the store to read-only
+        // ref count of Arc
     }
 }
