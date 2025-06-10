@@ -67,6 +67,7 @@ impl Display for SegmentHeader {
 }
 
 pub struct Segment {
+    #[allow(dead_code)]
     file: File,
     pub filename: path::PathBuf,
     data: memmap2::Mmap,

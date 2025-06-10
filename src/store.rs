@@ -230,6 +230,7 @@ impl Store {
         self.0.get_stream_range(stream_id)
     }
 
+    #[allow(dead_code)]
     fn get_last_segment_entry_index(&self) -> Result<u64> {
         let segment_files = self.segment_files.read().unwrap();
         if segment_files.is_empty() {
