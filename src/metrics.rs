@@ -12,11 +12,20 @@ use prometheus_client::{
 
 lazy_static! {
     pub static ref registry: Mutex<Registry> = Mutex::new(Registry::default());
-    pub static ref wal_write_seconds: Histogram = {
+    pub static ref wal_write_file_seconds: Histogram = {
         let h = Histogram::new(exponential_buckets(0.00001, 1.25, 60));
         registry.lock().unwrap().register(
             "wal_write_log_seconds",
             "Duration of Wal Write in seconds",
+            h.clone(),
+        );
+        h
+    };
+    pub static ref wal_recv_entry_seconds: Histogram = {
+        let h = Histogram::new(exponential_buckets(0.00001, 1.25, 60));
+        registry.lock().unwrap().register(
+            "wal_recv_entry_seconds",
+            "Duration of Wal Read entrys in seconds",
             h.clone(),
         );
         h

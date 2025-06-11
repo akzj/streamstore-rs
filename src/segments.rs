@@ -1,11 +1,13 @@
 use crate::{errors, mem_table::MemTable, store::SegmentArc};
 use anyhow::Result;
+use crc::Crc;
 use std::{
     collections::HashMap,
     fmt::Display,
     fs::File,
     io::{self, Write},
     path::{self},
+    rc::Rc,
     sync::atomic,
 };
 
@@ -27,7 +29,7 @@ pub struct SegmentStreamHeader {
     // The size of the stream in the file
     pub(crate) size: u64,
     // checksum of the stream
-    pub(crate) crc_check_sum: u64,
+    pub(crate) crc64: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -85,6 +87,29 @@ impl Segment {
             drop_delete: atomic::AtomicBool::new(false),
         };
         Ok(segment)
+    }
+
+    pub fn check_crc(&self) -> Result<bool> {
+        let header = self.get_segment_header();
+        if header.version != SEGMENT_HEADER_VERSION_V1 {
+            return Err(anyhow::anyhow!(
+                "Invalid segment header version: {}",
+                header.version
+            ));
+        }
+
+        for stream_header in self.get_stream_headers() {
+            let stream_data = self.stream_data(stream_header.stream_id);
+            if let Some(data) = stream_data {
+                let crc64 = Crc::<u64>::new(&crc::CRC_64_REDIS);
+                let mut hash = crc64.digest();
+                hash.update(data);
+                if hash.finalize() != stream_header.crc64 {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
     }
 
     pub fn set_drop_delete(&self, drop_delete: bool) {
@@ -247,12 +272,11 @@ pub(crate) fn generate_segment(
         .iter()
         .for_each(|(_, stream_table)| {
             let stream_header = SegmentStreamHeader {
-                version: SEGMENT_STREAM_HEADER_VERSION_V1,
-                crc_check_sum: 0,
-                file_offset: 0,
                 size: stream_table.size,
+                crc64: stream_table.crc64(),
                 offset: stream_table.offset,
                 stream_id: stream_table.stream_id,
+                ..Default::default()
             };
             segment_stream_headers.push(stream_header);
         });
@@ -315,7 +339,7 @@ pub(crate) fn generate_segment(
             assert!(stream_header.size == segment_stream_headers[i].size);
             assert!(stream_header.offset == segment_stream_headers[i].offset);
             assert!(stream_header.version == segment_stream_headers[i].version);
-            assert!(stream_header.crc_check_sum == segment_stream_headers[i].crc_check_sum);
+            assert!(stream_header.crc64 == segment_stream_headers[i].crc64);
         }
     }
 
@@ -353,6 +377,7 @@ pub(crate) fn merge_segments(
 
     assert!(align_of::<SegmentHeader>() <= 8);
 
+    let begin = std::time::Instant::now();
     let temp_file_path = segment_file_path.with_extension("tmp");
 
     let mut file = File::create(&temp_file_path).map_err(errors::new_io_error)?;
@@ -369,6 +394,11 @@ pub(crate) fn merge_segments(
         }
     });
 
+    // Calculate the CRC64 checksum for the segment data
+    // Use the Redis CRC64 algorithm
+
+    let mut segment_data_map = HashMap::new();
+
     let mut header_map = HashMap::new();
 
     for segment in segments.iter() {
@@ -382,8 +412,24 @@ pub(crate) fn merge_segments(
                     ..Default::default()
                 })
                 .size += header.size;
+
+            let entry = segment_data_map
+                .entry(&header.stream_id)
+                .or_insert_with(|| Vec::new());
+            let data = segment.stream_data(header.stream_id).unwrap();
+            entry.push(data);
         }
     }
+
+    for (stream_id, datas) in segment_data_map.iter() {
+        let crc64 = Crc::<u64>::new(&crc::CRC_64_REDIS);
+        let mut hash = crc64.digest();
+        for data in datas.iter() {
+            hash.update(data);
+        }
+        header_map.get_mut(stream_id).unwrap().crc64 = hash.finalize();
+    }
+
     let mut segment_stream_headers = header_map
         .into_iter()
         .map(|(_, header)| header)
@@ -449,7 +495,7 @@ pub(crate) fn merge_segments(
             assert!(stream_header.size == segment_stream_headers[i].size);
             assert!(stream_header.offset == segment_stream_headers[i].offset);
             assert!(stream_header.version == segment_stream_headers[i].version);
-            assert!(stream_header.crc_check_sum == segment_stream_headers[i].crc_check_sum);
+            assert!(stream_header.crc64 == segment_stream_headers[i].crc64);
         }
     }
 
@@ -470,6 +516,13 @@ pub(crate) fn merge_segments(
 
     // rename the file
     std::fs::rename(temp_file_path, &segment_file_path).map_err(errors::new_io_error)?;
+
+    log::debug!(
+        "Segment {} merged in {} ms",
+        segment_file_path.display(),
+        begin.elapsed().as_millis()
+    );
+
     Ok(Segment::open(&segment_file_path)?)
 }
 
@@ -536,7 +589,7 @@ fn test_segment_header_size() {
             "header.size {}",
             header.size
         ); // 1000 entries * 10 bytes each
-        assert!(header.crc_check_sum == 0); // checksum is not calculated in this test
+        assert!(header.crc64 == 0); // checksum is not calculated in this test
 
         file_offset += header.size;
     }

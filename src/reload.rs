@@ -16,7 +16,7 @@ use crate::{
     segments::Segment,
 };
 
-pub fn reload_segments(segment_path: &str) -> Result<VecDeque<Arc<Segment>>> {
+pub fn reload_segments(segment_path: &str, check_crc: bool) -> Result<VecDeque<Arc<Segment>>> {
     // Check if the segment path exists
     if !std::path::Path::new(segment_path).exists() {
         // create the segment path if it does not exist
@@ -39,6 +39,21 @@ pub fn reload_segments(segment_path: &str) -> Result<VecDeque<Arc<Segment>>> {
         }
 
         let segment = Segment::open(&filename)?;
+
+        if check_crc {
+            // check crc
+            let begin = std::time::Instant::now();
+            segment.check_crc().context(format!(
+                "Failed to check CRC for segment file: {:?}",
+                filename
+            ))?;
+            log::info!(
+                "CRC check passed for segment file: {:?} elapsed seconds {}",
+                filename,
+                begin.elapsed().as_secs()
+            );
+        }
+
         segment_files.push_back(std::sync::Arc::new(segment));
     }
 

@@ -10,13 +10,6 @@ pub struct StreamData {
     pub data: Vec<u8>,
 }
 
-pub struct StreamTable {
-    pub stream_id: u64,
-    pub offset: u64,
-    pub size: u64,
-    pub stream_datas: Vec<StreamData>,
-}
-
 impl StreamData {
     pub fn new(stream_id: u64, offset: u64, buffer_cap: u64) -> Self {
         StreamData {
@@ -62,6 +55,13 @@ impl StreamData {
     pub fn cap_remaining(&self) -> usize {
         STREAM_DATA_BUFFER_CAP as usize - self.data.len()
     }
+}
+
+pub struct StreamTable {
+    pub stream_id: u64,
+    pub offset: u64,
+    pub size: u64,
+    pub stream_datas: Vec<StreamData>,
 }
 
 impl StreamTable {
@@ -116,6 +116,15 @@ impl StreamTable {
                 assert_eq!(stream_data.size(), STREAM_DATA_BUFFER_CAP);
             }
         }
+    }
+
+    pub fn crc64(&self) -> u64 {
+        let crc64 = crc::Crc::<u64>::new(&crc::CRC_64_REDIS);
+        let mut digest = crc64.digest();
+        for stream_data in &self.stream_datas {
+            digest.update(&stream_data.data);
+        }
+        digest.finalize()
     }
 
     pub fn read_stream(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {

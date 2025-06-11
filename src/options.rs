@@ -10,6 +10,7 @@ pub struct Options {
     pub(crate) max_tables_count: u64,
     pub(crate) segment_merge_count: u64,
     pub(crate) max_segment_merge_level: u32,
+    pub(crate) reload_check_crc: bool,
 }
 
 impl Default for Options {
@@ -22,6 +23,7 @@ impl Default for Options {
             max_tables_count: 10,
             segment_merge_count: 5,
             max_segment_merge_level: 5,
+            reload_check_crc: false,
         }
     }
 }
@@ -48,6 +50,16 @@ impl Options {
         options.wal_path = format!("{}/wal", dir);
         options.segment_path = format!("{}/segment", dir);
         options
+    }
+
+    pub fn reload_check_crc(&mut self, reload_check_crc: bool) -> &mut Self {
+        self.reload_check_crc = reload_check_crc;
+        self
+    }
+
+    pub fn segment_merge_count(&mut self, segment_merge_count: u64) -> &mut Self {
+        self.segment_merge_count = segment_merge_count;
+        self
     }
 
     pub fn wal_path(&mut self, wal_path: &str) -> &mut Self {

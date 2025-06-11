@@ -28,8 +28,8 @@ fn main() {
     log::info!("Starting streamstore example");
 
     let mut options = streamstore::options::Options::default();
-    options.max_wal_size(32 * 1024);
-    options.max_table_size(64 * 1024);
+    //options.max_wal_size(32 * 1024);
+    //options.max_table_size(64 * 1024);
 
     println!("options {:?}", &options);
 
@@ -71,7 +71,7 @@ fn main() {
 
     let count = 1000000;
     for i in 0..count {
-        let data = format!("hello world {}\n", i);
+        let data = format!("hello world {}\n", i).repeat(100);
         //log::info!("Appending entry: {}", data);
 
         hash.update(data.as_bytes());
@@ -136,7 +136,7 @@ fn main() {
     let mut read_buffer = vec![];
 
     loop {
-        let rand_sizd = rand::random::<u64>() % 100 + 1;
+        let rand_sizd = rand::random::<u64>() % 1024 + 1;
         let mut buffer = vec![0; rand_sizd as usize];
         let bytes_read = reader.read(&mut buffer).unwrap();
         if bytes_read == 0 {
@@ -176,5 +176,8 @@ fn main() {
 
     // wait for a while to ensure drop is complete
     sleep(time::Duration::from_secs(1));
+
+    options.reload_check_crc(true).open_store().unwrap();
+
     log::info!("Example completed successfully");
 }

@@ -64,7 +64,7 @@ impl WalInner {
         file_guard.flush().map_err(errors::new_io_error)?;
 
         let elapsed = begin_ts.elapsed();
-        metrics::wal_write_seconds.observe(elapsed.as_secs_f64());
+        metrics::wal_write_file_seconds.observe(elapsed.as_secs_f64());
 
         Ok(())
     }
@@ -134,8 +134,11 @@ impl WalInner {
 
     pub fn run(&self) -> Result<()> {
         // Start the WAL thread
+
+        let receiver = self.receiver.lock().unwrap();
         loop {
-            let item = match self.receiver.lock().unwrap().recv() {
+            let begin_ts = std::time::Instant::now();
+            let item = match receiver.recv() {
                 Ok(item) => item,
                 Err(e) => {
                     log::info!("senders are dropped");
@@ -144,9 +147,10 @@ impl WalInner {
                 }
             };
 
-            let mut items = vec![item];
+            let mut items = Vec::with_capacity(128);
+            items.push(item);
             loop {
-                match self.receiver.lock().unwrap().try_recv() {
+                match receiver.try_recv() {
                     Ok(item) => {
                         items.push(item);
                         if items.len() >= 128 {
@@ -158,6 +162,8 @@ impl WalInner {
                     }
                 }
             }
+            metrics::wal_recv_entry_seconds.observe(begin_ts.elapsed().as_secs_f64());
+
             // Write the items to the file
             match self.batch_write(&items) {
                 Ok(_) => {}

@@ -318,12 +318,14 @@ impl StreamStoreInner {
         let segment = match merge_segments(&file_name, &to_merges) {
             Ok(segment) => {
                 log::info!(
-                    "Merged {} segments into new segment: {}",
+                    "Merged {:?} segments into new segment: {}",
                     &to_merges
                         .iter()
-                        .map(|s| s.filename().to_str().unwrap().to_string())
-                        .collect::<Vec<_>>()
-                        .join(", "),
+                        .map(|s| (
+                            s.filename().to_str().unwrap().to_string(),
+                            s.get_segment_header().level
+                        ))
+                        .collect::<Vec<_>>(),
                     file_name.display()
                 );
                 segment
@@ -483,14 +485,33 @@ impl Store {
         Ok(last_segment.entry_index().1)
     }
 
-    fn reload_offset(&self) {
-        // reload the segments
-        for segment in self.segment_files.read().unwrap().iter() {
+    pub fn reload(options: &Options) -> Result<Self> {
+        let mut offset_map = Arc::new(Mutex::new(HashMap::new()));
+
+        let get_stream_offset_fn: GetStreamOffsetFn = Arc::new(Box::new({
+            let offset_map = offset_map.clone();
+            move |stream_id| match offset_map.lock().unwrap().get(&stream_id) {
+                Some(offset) => Ok(*offset),
+                None => Ok(0), // Default to 0 if not found
+            }
+        }));
+
+        let (entries_sender, entries_receiver) = sync_channel::<Vec<Entry>>(100);
+
+        let mut last_segment_entry_index = 0;
+        let mut segment_files = reload_segments(&options.segment_path, options.reload_check_crc)?;
+        if !segment_files.is_empty() {
+            last_segment_entry_index = segment_files.back().unwrap().entry_index().1;
+        }
+
+        // reload the offsets from the segment files
+        log::info!("Reloading offsets from segment files");
+        for segment in segment_files.iter() {
             for stream_header in segment.get_stream_headers() {
                 let stream_id = stream_header.stream_id;
                 let offset = stream_header.offset + stream_header.size;
-                self.offsets.lock().unwrap().insert(stream_id, offset);
-                log::info!(
+                offset_map.lock().unwrap().insert(stream_id, offset);
+                log::debug!(
                     "Reloaded stream {} with offset {} from segment {} ",
                     stream_id,
                     offset,
@@ -499,13 +520,21 @@ impl Store {
             }
         }
 
-        // reload the memtable
-        for mem_tables in self.mem_tables.read().unwrap().iter() {
+        let (mut mem_tables, files, file) = reload::reload_wals(
+            &options.wal_path,
+            last_segment_entry_index,
+            options.max_table_size,
+            get_stream_offset_fn,
+        )?;
+
+        // reload the offsets from the memtables
+        log::info!("Reloading offsets from memtables");
+        for mem_tables in mem_tables.iter() {
             let stream_tables = mem_tables.get_stream_tables();
             for (stream_id, stream_table) in &*stream_tables {
                 match stream_table.get_stream_range() {
                     Some((_begin, end)) => {
-                        self.offsets.lock().unwrap().insert(stream_id.clone(), end);
+                        offset_map.lock().unwrap().insert(stream_id.clone(), end);
                         log::info!(
                             "Reloaded stream {} with offset {} from memtable",
                             stream_id,
@@ -519,56 +548,10 @@ impl Store {
             }
         }
 
-        //reload from the memtable
-        let memtable = self.table.load();
-        let stream_tables = memtable.get_stream_tables();
-        for (stream_id, stream_table) in &*stream_tables {
-            match stream_table.get_stream_range() {
-                Some((_begin, end)) => {
-                    self.offsets.lock().unwrap().insert(stream_id.clone(), end);
-                    log::info!(
-                        "Reloaded stream {} with offset {} from memtable",
-                        stream_id,
-                        end
-                    );
-                }
-                None => {
-                    log::warn!("Stream {} not found in memtable", stream_id);
-                }
-            }
-        }
-    }
-
-    pub fn reload(config: &Options) -> Result<Self> {
-        let offset_map = Arc::new(Mutex::new(HashMap::new()));
-
-        let get_stream_offset_fn: GetStreamOffsetFn = Arc::new(Box::new({
-            let offset_map = offset_map.clone();
-            move |stream_id| match offset_map.lock().unwrap().get(&stream_id) {
-                Some(offset) => Ok(*offset),
-                None => Ok(0), // Default to 0 if not found
-            }
-        }));
-
-        let (entries_sender, entries_receiver) = sync_channel::<Vec<Entry>>(100);
-
-        let mut last_segment_entry_index = 0;
-        let mut segment_files = reload_segments(&config.segment_path)?;
-        if !segment_files.is_empty() {
-            last_segment_entry_index = segment_files.back().unwrap().entry_index().1;
-        }
-
-        let (mut memtables, files, file) = reload::reload_wals(
-            &config.wal_path,
-            last_segment_entry_index,
-            config.max_table_size,
-            get_stream_offset_fn,
-        )?;
-        let memtable = memtables.pop().unwrap();
-
+        let mem_table = mem_tables.pop().unwrap();
         // generate the segment files from the memtable
-        for table in memtables {
-            let filename = std::path::Path::new(&config.segment_path)
+        for table in mem_tables {
+            let filename = std::path::Path::new(&options.segment_path)
                 .join(format!("{}.seg", table.get_first_entry()));
 
             generate_segment(&filename, &table)?;
@@ -577,12 +560,12 @@ impl Store {
         }
 
         let is_readonly = Arc::new(atomic::AtomicBool::new(false));
-        let last_log_entry = memtable.get_last_entry();
+        let last_log_entry = mem_table.get_last_entry();
 
         let wal = Wal::new(
             file,
-            config.wal_path.clone(),
-            config.max_wal_size,
+            options.wal_path.clone(),
+            options.max_wal_size,
             last_log_entry,
             entries_sender,
             files,
@@ -600,11 +583,11 @@ impl Store {
         log::info!("last log entry: {}", last_log_entry);
 
         // unwrap the Rc to get the inner memtable
-        let memtable = Rc::into_inner(memtable).unwrap();
+        let memtable = Rc::into_inner(mem_table).unwrap();
 
         let inner = StreamStoreInner {
             wal_inner: wal.clone_inner(),
-            config: config.clone(),
+            config: options.clone(),
             offsets: offset_map.clone(),
             is_readonly: is_readonly.clone(),
             entry_index: AtomicU64::new(last_log_entry + 1),
@@ -619,7 +602,6 @@ impl Store {
             wal: Arc::new(wal),
         };
 
-        store.reload_offset();
         // start background thread
         store.start();
 
