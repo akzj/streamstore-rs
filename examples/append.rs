@@ -4,7 +4,7 @@ use std::env;
 use std::io::{Read, Seek, Write};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::sleep;
-use streamstore::entry::AppendEntryResultFn;
+use streamstore_rs::entry::AppendEntryResultFn;
 fn main() {
     // set rust_log to use the environment variable RUST_LOG
     let log_level = "RUST_LOG";
@@ -27,7 +27,7 @@ fn main() {
         .init();
     log::info!("Starting streamstore example");
 
-    let mut options = streamstore::options::Options::default();
+    let mut options = streamstore_rs::options::Options::default();
     options.max_wal_size(320);
     options.max_table_size(640);
 

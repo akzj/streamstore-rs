@@ -1,6 +1,6 @@
 use crc::Crc;
-use std::io::Write;
 use std::io::Read;
+use std::io::Write;
 
 #[tokio::main]
 async fn main() {
@@ -23,7 +23,7 @@ async fn main() {
         .init();
     log::info!("Starting streamstore example");
 
-    let mut options = streamstore::options::Options::new_with_data_path("data/async");
+    let mut options = streamstore_rs::options::Options::new_with_data_path("data/async");
     options.max_wal_size(32 * 1024);
     options.max_table_size(64 * 1024);
 
@@ -86,8 +86,7 @@ async fn main() {
     if read_check_sum != write_check_sum {
         panic!(
             "Checksum mismatch: expected {}, got {}",
-            write_check_sum,
-            read_check_sum
+            write_check_sum, read_check_sum
         );
     } else {
         log::info!("Checksum match: {}", read_check_sum);
