@@ -126,6 +126,10 @@ impl Segment {
         self.filename.clone()
     }
 
+    pub fn level(&self) -> u32 {
+        self.get_segment_header().level
+    }
+
     pub fn get_segment_header(&self) -> SegmentHeader {
         unsafe { &*(self.data() as *const SegmentHeader) }.clone()
     }
@@ -232,11 +236,9 @@ impl Drop for Segment {
                     );
                 }
                 Ok(_) => {
-                    log::debug!("Segment file deleted: {}", self.filename.display());
+                    log::info!("Segment file deleted: {}", self.filename.display());
                 }
             }
-        } else {
-            log::debug!("Not deleting segment file: {}", self.filename.display());
         }
     }
 }

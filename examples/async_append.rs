@@ -40,7 +40,7 @@ async fn main() {
     let crc64 = Crc::<u64>::new(&crc::CRC_64_REDIS);
     let mut hash = crc64.digest();
 
-    let count = 1000000;
+    let count = 100000;
     for i in 0..count {
         let data = format!("hello world {}\n", i);
         //log::info!("Appending entry: {}", data);
@@ -84,7 +84,7 @@ async fn main() {
     );
 
     if read_check_sum != write_check_sum {
-        log::error!(
+        panic!(
             "Checksum mismatch: expected {}, got {}",
             write_check_sum,
             read_check_sum

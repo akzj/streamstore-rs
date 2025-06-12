@@ -37,7 +37,7 @@ pub struct StreamStoreInner {
     entry_receiver: Mutex<Receiver<Vec<Entry>>>,
 
     pub(crate) table: ArcSwap<MemTable>,
-    pub(crate) mem_tables: std::sync::RwLock<Vec<MemTableArc>>,
+    pub(crate) mem_tables: std::sync::RwLock<VecDeque<MemTableArc>>,
     pub(crate) segment_files: RwLock<VecDeque<SegmentArc>>,
     pub(crate) offsets: Arc<Mutex<HashMap<u64, u64>>>,
     pub(crate) is_readonly: Arc<atomic::AtomicBool>,
@@ -62,7 +62,60 @@ impl StreamStoreInner {
         let segment_files = self.segment_files.read().unwrap();
         log::debug!("Segment files:");
         for segment in segment_files.iter() {
-            log::debug!("  - {}", segment.filename().display());
+            log::debug!(
+                "  - filename {} level {}",
+                segment.filename().display(),
+                segment.level()
+            );
+            for stream_header in segment.get_stream_headers() {
+                log::debug!(
+                    "    - Stream ID: {}, Offset: [{} {})",
+                    stream_header.stream_id,
+                    stream_header.offset,
+                    stream_header.offset + stream_header.size
+                );
+            }
+        }
+    }
+
+    pub fn print_mem_tables(&self) {
+        let mem_tables = self.mem_tables.read().unwrap();
+        log::debug!("Memory tables:");
+        for table in mem_tables.iter() {
+            log::debug!(
+                "  - First Entry: {}, Last Entry: {}, Size: {}",
+                table.get_first_entry(),
+                table.get_last_entry(),
+                table.get_size()
+            );
+            for stream_id in table.get_stream_ids() {
+                match table.get_stream_range(stream_id) {
+                    Some((begin, end)) => {
+                        log::debug!("    - Stream ID: {}, Range: [{} {})", stream_id, begin, end);
+                    }
+                    None => {
+                        panic!("    - Stream ID: {} not found", stream_id);
+                    }
+                }
+            }
+        }
+
+        let table = self.table.load();
+        log::debug!(
+            "  - First Entry: {}, Last Entry: {}, Size: {}",
+            table.get_first_entry(),
+            table.get_last_entry(),
+            table.get_size()
+        );
+        for stream_id in table.get_stream_ids() {
+            match table.get_stream_range(stream_id) {
+                Some((begin, end)) => {
+                    log::debug!("    - Stream ID: {}, Range: [{} {})", stream_id, begin, end);
+                }
+                None => {
+                    assert_eq!(true, false, "    - Stream ID: {} not found", stream_id);
+                }
+            }
         }
     }
 
@@ -186,7 +239,7 @@ impl StreamStoreInner {
 
                 // Check if the table size is greater than the max size
                 if table.get_size() > self.config.max_table_size {
-                    self.mem_tables.write().unwrap().push(table.clone());
+                    self.mem_tables.write().unwrap().push_back(table.clone());
                     self.table
                         .store(Arc::new(MemTable::new(&get_stream_offset_fn.clone())));
 
@@ -208,6 +261,7 @@ impl StreamStoreInner {
     fn run_segment_generater(
         &self,
         receiver: Receiver<(path::PathBuf, MemTableArc)>,
+        cond: Arc<(Mutex<u64>, Condvar)>,
     ) -> Result<()> {
         loop {
             if self.is_readonly.load(atomic::Ordering::SeqCst) {
@@ -258,8 +312,10 @@ impl StreamStoreInner {
 
             let mut memtables = self.mem_tables.write().unwrap();
             if memtables.len() > self.config.max_tables_count as usize {
-                memtables.remove(0);
+                memtables.pop_front();
             }
+            // notify the segment merger
+            cond.1.notify_one();
         }
         Ok(())
     }
@@ -361,18 +417,11 @@ impl StreamStoreInner {
     }
 
     // Start the segment generator thread
-    fn run_segment_merger(&self, stop_cond: Arc<(Mutex<u64>, Condvar)>) -> Result<()> {
+    fn run_segment_merger(&self, signal: Arc<(Mutex<u64>, Condvar)>) -> Result<()> {
         loop {
-            let result = stop_cond
-                .1
-                .wait_timeout(
-                    stop_cond.0.lock().unwrap(),
-                    std::time::Duration::from_secs(1),
-                )
-                .unwrap();
-            if result.1.timed_out() == false {
-                log::info!("Segment merger stopped by condition variable");
-                break;
+            if *signal.1.wait(signal.0.lock().unwrap()).unwrap() == 1 {
+                log::info!("Segment merger thread exiting");
+                return Ok(());
             }
 
             match self.merge_segments() {
@@ -387,7 +436,6 @@ impl StreamStoreInner {
                 }
             }
         }
-        Ok(())
     }
 
     pub fn get_stream_range(&self, stream_id: u64) -> Result<(u64, u64)> {
@@ -486,15 +534,7 @@ impl Store {
     }
 
     pub fn reload(options: &Options) -> Result<Self> {
-        let mut offset_map = Arc::new(Mutex::new(HashMap::new()));
-
-        let get_stream_offset_fn: GetStreamOffsetFn = Arc::new(Box::new({
-            let offset_map = offset_map.clone();
-            move |stream_id| match offset_map.lock().unwrap().get(&stream_id) {
-                Some(offset) => Ok(*offset),
-                None => Ok(0), // Default to 0 if not found
-            }
-        }));
+        let mut offset_map = HashMap::new();
 
         let (entries_sender, entries_receiver) = sync_channel::<Vec<Entry>>(100);
 
@@ -510,13 +550,7 @@ impl Store {
             for stream_header in segment.get_stream_headers() {
                 let stream_id = stream_header.stream_id;
                 let offset = stream_header.offset + stream_header.size;
-                offset_map.lock().unwrap().insert(stream_id, offset);
-                log::debug!(
-                    "Reloaded stream {} with offset {} from segment {} ",
-                    stream_id,
-                    offset,
-                    segment.filename().display()
-                );
+                offset_map.insert(stream_id, offset);
             }
         }
 
@@ -524,7 +558,7 @@ impl Store {
             &options.wal_path,
             last_segment_entry_index,
             options.max_table_size,
-            get_stream_offset_fn,
+            &mut offset_map,
         )?;
 
         // reload the offsets from the memtables
@@ -534,7 +568,7 @@ impl Store {
             for (stream_id, stream_table) in &*stream_tables {
                 match stream_table.get_stream_range() {
                     Some((_begin, end)) => {
-                        offset_map.lock().unwrap().insert(stream_id.clone(), end);
+                        offset_map.insert(stream_id.clone(), end);
                         log::info!(
                             "Reloaded stream {} with offset {} from memtable",
                             stream_id,
@@ -548,15 +582,15 @@ impl Store {
             }
         }
 
-        let mem_table = mem_tables.pop().unwrap();
+        let mem_table = mem_tables.pop_back().unwrap();
         // generate the segment files from the memtable
         for table in mem_tables {
-            let filename = std::path::Path::new(&options.segment_path)
-                .join(format!("{}.seg", table.get_first_entry()));
-
-            generate_segment(&filename, &table)?;
-            let segment = Segment::open(&filename)?;
-            segment_files.push_back(Arc::new(segment));
+            let filename = std::path::Path::new(&options.segment_path).join(format!(
+                "{}-{}.seg",
+                table.get_first_entry(),
+                table.get_last_entry()
+            ));
+            segment_files.push_back(Arc::new(generate_segment(&filename, &table)?));
         }
 
         let is_readonly = Arc::new(atomic::AtomicBool::new(false));
@@ -588,11 +622,11 @@ impl Store {
         let inner = StreamStoreInner {
             wal_inner: wal.clone_inner(),
             config: options.clone(),
-            offsets: offset_map.clone(),
+            offsets: Arc::new(Mutex::new(offset_map)),
             is_readonly: is_readonly.clone(),
             entry_index: AtomicU64::new(last_log_entry + 1),
             table: ArcSwap::new(Arc::new(memtable)),
-            mem_tables: RwLock::new(Vec::new()),
+            mem_tables: RwLock::new(VecDeque::new()),
             segment_files: RwLock::new(segment_files),
             entry_receiver: Mutex::new(entries_receiver),
         };
@@ -626,10 +660,9 @@ impl Store {
             .name("store::run".to_string())
             .spawn({
                 let _self = self.inner.clone();
-                let cond = cond.clone();
+
                 move || {
                     _self.memtable_writer(sender);
-                    cond.1.notify_all();
                 }
             });
 
@@ -637,8 +670,11 @@ impl Store {
             .name("run_segment_generater".to_string())
             .spawn({
                 let _self = self.inner.clone();
+                let cond = cond.clone();
                 move || {
-                    _self.run_segment_generater(receiver).unwrap();
+                    _self.run_segment_generater(receiver, cond.clone()).unwrap();
+                    *cond.0.lock().unwrap() = 1;
+                    cond.1.notify_all();
                 }
             });
 

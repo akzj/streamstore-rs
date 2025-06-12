@@ -1,11 +1,12 @@
 use anyhow::{Context, Result};
+use core::hash;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, VecDeque, hash_map},
     fs::{File, OpenOptions},
     io::Seek,
     path::PathBuf,
     rc::Rc,
-    sync::Arc,
+    sync::{Arc, Mutex},
     vec,
 };
 
@@ -122,8 +123,8 @@ pub fn reload_wals(
     wal_path: &str,
     last_segment_entry_index: u64,
     max_table_size: u64,
-    get_stream_offset_fn: GetStreamOffsetFn,
-) -> Result<(Vec<Rc<MemTable>>, HashMap<u64, PathBuf>, File)> {
+    offset_map: &mut hash_map::HashMap<u64, u64>,
+) -> Result<(VecDeque<Rc<MemTable>>, HashMap<u64, PathBuf>, File)> {
     // Check if the WAL path exists
     if !std::path::Path::new(wal_path).exists() {
         // create the wal path if it does not exist
@@ -131,11 +132,24 @@ pub fn reload_wals(
         log::info!("WAL directory created: {}", wal_path);
     }
 
+    let offset_map = Arc::new(Mutex::new(offset_map.clone()));
+
+    let get_stream_offset_fn: GetStreamOffsetFn = Arc::new(Box::new({
+        let offset_map = offset_map.clone();
+        move |stream_id| match offset_map.lock().unwrap().get(&stream_id) {
+            Some(offset) => {
+                log::debug!("Get stream offset for stream_id {}: {}", stream_id, offset);
+                Ok(*offset)
+            }
+            None => Ok(0), // Default to 0 if not found
+        }
+    }));
+
     let wals = list_wal_files(wal_path)?;
     let mut files = HashMap::new();
     let mut entry_index = 0;
     let mut table = Rc::new(MemTable::new(&get_stream_offset_fn));
-    let mut tables = Vec::new();
+    let mut tables = VecDeque::new();
     // Reload the WAL files
     for (filename, _entry_index) in &wals {
         log::debug!("Reloading WAL file: {}", filename);
@@ -145,9 +159,10 @@ pub fn reload_wals(
         file.decode(Box::new(|entry| {
             count += 1;
             // Handle the entry
-            if entry.id < last_segment_entry_index {
+            if entry.id <= last_segment_entry_index {
                 return Ok(true);
             }
+
             let _ = table.append(&entry).unwrap();
             // check table size > max_table_size
             if table.get_size() > max_table_size {
@@ -156,7 +171,19 @@ pub fn reload_wals(
                     table.get_size(),
                     max_table_size
                 );
-                tables.push(table.clone());
+
+                for stream_id in table.get_stream_ids() {
+                    let (_begin, end) = table.get_stream_range(stream_id).unwrap();
+                    log::debug!(
+                        "Stream ID {} range: begin {}, end {}",
+                        stream_id,
+                        _begin,
+                        end
+                    );
+                    offset_map.lock().unwrap().insert(stream_id, end);
+                }
+
+                tables.push_back(table.clone());
                 // create new segment
                 table = Rc::new(MemTable::new(&get_stream_offset_fn));
             }
@@ -181,10 +208,8 @@ pub fn reload_wals(
     // remove the last entry index from files
     files.remove(&entry_index);
 
-    tables.push(table.clone());
+    tables.push_back(table.clone());
     log::info!("Reloaded {} tables from WAL files", tables.len());
-
-    //self.table.lock().unwrap().box
 
     let file_name = if wals.is_empty() {
         std::path::Path::new(&wal_path).join(format!("{}.wal", entry_index + 1))

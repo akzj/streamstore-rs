@@ -43,6 +43,16 @@ impl StreamReader {
         self.offset.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    pub fn offset_inc(&self, inc: usize) {
+        self.offset
+            .fetch_add(inc as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn set_offset(&self, offset: u64) {
+        self.offset
+            .store(offset, std::sync::atomic::Ordering::Relaxed);
+    }
+
     fn reset_read_state(&mut self) {
         self.read_memtable = None;
         self.read_segment = None;
@@ -66,8 +76,7 @@ impl StreamReader {
 
                 let bytes_read = segment.read_stream(self.stream_id, self.offset(), buf)?;
                 if bytes_read > 0 {
-                    self.offset
-                        .fetch_add(bytes_read as u64, std::sync::atomic::Ordering::Relaxed);
+                    self.offset_inc(bytes_read);
                     read_bytes_all += bytes_read;
                     if read_bytes_all >= buf.len() {
                         return Ok(read_bytes_all); // Stop if we filled the buffer
@@ -86,8 +95,7 @@ impl StreamReader {
                         self.offset(),
                         &mut buf[read_bytes_all..],
                     )?;
-                    self.offset
-                        .fetch_add(bytes_read as u64, std::sync::atomic::Ordering::Relaxed);
+                    self.offset_inc(bytes_read);
                     read_bytes_all += bytes_read;
                     if read_bytes_all >= buf.len() {
                         self.read_segment = Some(Arc::downgrade(&segment));
@@ -104,7 +112,6 @@ impl StreamReader {
                 }
             }
         }
-
         *self.read_state.lock().unwrap() = StreamReadState::MemTables;
         Ok(read_bytes_all)
     }
@@ -114,8 +121,7 @@ impl StreamReader {
         if let Some(memtable) = &self.read_memtable {
             let bytes_read =
                 memtable.read_stream(self.stream_id, self.offset(), &mut buf[read_bytes_all..])?;
-            self.offset
-                .fetch_add(bytes_read as u64, std::sync::atomic::Ordering::Relaxed);
+            self.offset_inc(bytes_read);
             read_bytes_all += bytes_read;
             if read_bytes_all >= buf.len() {
                 return Ok(read_bytes_all); // Stop if we filled the buffer
@@ -136,8 +142,7 @@ impl StreamReader {
                     let read_buf = &mut buf[read_bytes_all..];
                     let bytes_read =
                         memtable.read_stream(self.stream_id, self.offset(), read_buf)?;
-                    self.offset
-                        .fetch_add(bytes_read as u64, std::sync::atomic::Ordering::Relaxed);
+                    self.offset_inc(bytes_read);
                     read_bytes_all += bytes_read;
 
                     if read_bytes_all >= buf.len() {
@@ -268,8 +273,7 @@ impl io::Read for StreamReader {
                         self.offset(),
                         &mut buf[read_bytes_all..],
                     )?;
-                    self.offset
-                        .fetch_add(bytes_read as u64, std::sync::atomic::Ordering::Relaxed);
+                    self.offset_inc(bytes_read);
                     read_bytes_all += bytes_read;
                     return Ok(read_bytes_all); // Stop if we filled the buffer
                 }
@@ -314,23 +318,18 @@ impl io::Seek for StreamReader {
                     ));
                 }
                 self.reset_read_state();
-                self.offset
-                    .store(offset, std::sync::atomic::Ordering::Relaxed);
+                self.set_offset(offset);
                 return Ok(offset);
             }
             io::SeekFrom::End(offset) => (end, offset),
-            io::SeekFrom::Current(offset) => (
-                self.offset.load(std::sync::atomic::Ordering::Relaxed),
-                offset,
-            ),
+            io::SeekFrom::Current(offset) => (self.offset(), offset),
         };
 
         match base_offset.checked_add_signed(change) {
             Some(new_offset) => {
                 if new_offset >= begin && new_offset <= end {
                     self.reset_read_state();
-                    self.offset
-                        .store(new_offset, std::sync::atomic::Ordering::Relaxed);
+                    self.set_offset(new_offset);
                     return Ok(new_offset);
                 } else {
                     log::error!(

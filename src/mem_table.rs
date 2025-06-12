@@ -40,6 +40,11 @@ impl MemTable {
         self.size.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    pub fn get_stream_ids(&self) -> Vec<u64> {
+        let guard = self.stream_tables.lock().unwrap();
+        guard.keys().cloned().collect()
+    }
+
     pub fn get_stream_tables(&self) -> std::sync::MutexGuard<HashMap<u64, StreamTable>> {
         self.stream_tables.lock().unwrap()
     }

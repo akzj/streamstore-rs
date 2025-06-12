@@ -28,8 +28,8 @@ fn main() {
     log::info!("Starting streamstore example");
 
     let mut options = streamstore::options::Options::default();
-    //options.max_wal_size(32 * 1024);
-    //options.max_table_size(64 * 1024);
+    options.max_wal_size(320);
+    options.max_table_size(640);
 
     println!("options {:?}", &options);
 
@@ -69,13 +69,10 @@ fn main() {
     let crc64 = Crc::<u64>::new(&crc::CRC_64_REDIS);
     let mut hash = crc64.digest();
 
-    let count = 1000000;
+    let count = 10000;
     for i in 0..count {
-        let data = format!("hello world {}\n", i).repeat(100);
-        //log::info!("Appending entry: {}", data);
-
+        let data = format!("hello world {}\n", i);
         hash.update(data.as_bytes());
-
         store
             .append(1, data.into(), make_callback(cond.clone()))
             .unwrap();
@@ -155,29 +152,70 @@ fn main() {
 
     log::info!("Multi read check sum: {}", multi_read_check_sum);
     if multi_read_check_sum != write_check_sum {
-        log::error!(
+        panic!(
             "Multi read checksum mismatch: expected {}, got {}",
-            write_check_sum,
-            multi_read_check_sum
+            write_check_sum, multi_read_check_sum
         );
     } else {
         log::info!("Multi read checksum match: {}", multi_read_check_sum);
     }
 
-    //println!("Stream data: {}", String::from_utf8_lossy(&read_buffer));
-
-    // log::info!("Stream data: {:?}", String::from_utf8_lossy(&buffer));
-
-    //store.merge_segments().unwrap();
-
-    store.print_metrics();
+    // store.print_metrics();
     drop(reader);
     drop(store);
 
     // wait for a while to ensure drop is complete
     sleep(time::Duration::from_secs(1));
 
-    options.reload_check_crc(true).open_store().unwrap();
+    let store = options.reload_check_crc(true).open_store().unwrap();
+
+    store.print_segment_files();
+    store.print_mem_tables();
+
+    let begin = store.get_stream_begin(1).unwrap();
+    log::info!("Stream begin: {:?}", begin);
+
+    let end = store.get_stream_end(1).unwrap();
+    log::info!("Stream end: {:?}", end);
+
+    let mut reader = store.new_stream_reader(1).unwrap();
+
+    let crc64 = Crc::<u64>::new(&crc::CRC_64_REDIS);
+    let mut hash = crc64.digest();
+
+    let mut read_buffer = vec![];
+
+    loop {
+        let rand_sizd = rand::random::<u64>() % 1024 + 1;
+        let mut buffer = vec![0; rand_sizd as usize];
+        let bytes_read = reader.read(&mut buffer).unwrap();
+        if bytes_read == 0 {
+            log::info!("End of stream reached");
+            break;
+        }
+
+        buffer.truncate(bytes_read);
+
+        read_buffer.extend_from_slice(&buffer);
+
+        hash.update(&buffer);
+    }
+
+    let multi_read_check_sum = hash.finalize();
+
+    log::info!("reload multi read check sum: {}", multi_read_check_sum);
+    if multi_read_check_sum != write_check_sum {
+        panic!(
+            "reload multi read checksum mismatch: expected {}, got {}",
+            write_check_sum, multi_read_check_sum
+        );
+    } else {
+        log::info!("Reload multi read checksum match: {}", multi_read_check_sum);
+    }
+
+    drop(store);
+    drop(reader);
+    sleep(time::Duration::from_secs(1));
 
     log::info!("Example completed successfully");
 }
