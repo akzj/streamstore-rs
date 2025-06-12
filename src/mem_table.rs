@@ -3,28 +3,27 @@ use anyhow::Result;
 use std::{
     collections::HashMap,
     io,
-    sync::{self, Arc, Mutex, atomic::AtomicU64},
+    sync::{Arc, Mutex, atomic::AtomicU64},
 };
 
 pub type MemTableArc = Arc<MemTable>;
-pub type MemTableWeak = sync::Weak<MemTable>;
-pub(crate) type GetStreamOffsetFn = Arc<Box<dyn Fn(u64) -> Result<u64> + Send + Sync>>;
+pub(crate) type GetStreamOffset = Box<dyn Fn(u64) -> Result<u64, anyhow::Error> + Send + Sync>;
 pub struct MemTable {
     stream_tables: Mutex<HashMap<u64, StreamTable>>,
     first_entry: AtomicU64,
     last_entry: AtomicU64,
     size: AtomicU64,
-    get_stream_offset_fn: Mutex<GetStreamOffsetFn>,
+    get_stream_offset: Mutex<GetStreamOffset>,
 }
 
 impl MemTable {
-    pub fn new(get_stream_offset_fn: &GetStreamOffsetFn) -> Self {
+    pub fn new(get_stream_offset: GetStreamOffset) -> Self {
         MemTable {
             stream_tables: Mutex::new(HashMap::new()),
             first_entry: AtomicU64::new(0),
             last_entry: AtomicU64::new(0),
             size: AtomicU64::new(0),
-            get_stream_offset_fn: Mutex::new(get_stream_offset_fn.clone()),
+            get_stream_offset: Mutex::new(get_stream_offset),
         }
     }
 
@@ -85,7 +84,7 @@ impl MemTable {
         let res = match guard.get_mut(&entry.stream_id) {
             Some(stream_table) => stream_table,
             None => {
-                let offset = match self.get_stream_offset_fn.lock().unwrap()(entry.stream_id) {
+                let offset = match self.get_stream_offset.lock().unwrap()(entry.stream_id) {
                     Ok(offset) => offset,
                     Err(e) => return Err(e),
                 };
@@ -112,6 +111,9 @@ impl MemTable {
     }
 }
 
+/// Asserts that the type `T` is `Send` and `Sync`.
+/// This is useful for ensuring that types used in concurrent contexts are safe to share across threads.
+#[allow(unused)]
 fn assert_send_sync<T: Send + Sync>() {}
 
 #[cfg(test)]

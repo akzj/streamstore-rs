@@ -56,3 +56,5 @@ pub fn new_invalid_data() -> anyhow::Error {
 pub fn new_store_is_read_only() -> anyhow::Error {
     anyhow::anyhow!(Error::StoreIsReadOnly)
 }
+
+

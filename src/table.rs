@@ -1,13 +1,13 @@
-use std::io;
+use std::{io, slice::Iter};
 
 use anyhow::Result;
 
 const STREAM_DATA_BUFFER_CAP: u64 = 128 << 10; // 128KB
 
 pub struct StreamData {
-    pub stream_id: u64,
-    pub offset: u64,
-    pub data: Vec<u8>,
+    stream_id: u64,
+    offset: u64,
+    data: Vec<u8>,
 }
 
 impl StreamData {
@@ -48,8 +48,8 @@ impl StreamData {
         self.data.len() as u64
     }
 
-    pub fn offset(&self) -> u64 {
-        self.offset
+    pub fn data(&self) -> &[u8] {
+        &self.data
     }
 
     pub fn cap_remaining(&self) -> usize {
@@ -58,10 +58,10 @@ impl StreamData {
 }
 
 pub struct StreamTable {
-    pub stream_id: u64,
-    pub offset: u64,
-    pub size: u64,
-    pub stream_datas: Vec<StreamData>,
+    stream_id: u64,
+    offset: u64,
+    size: u64,
+    stream_datas: Vec<StreamData>,
 }
 
 impl StreamTable {
@@ -72,6 +72,19 @@ impl StreamTable {
             size: 0,
             stream_datas: Vec::new(),
         }
+    }
+
+    pub fn stream_id(&self) -> u64 {
+        self.stream_id
+    }
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+    pub fn stream_datas(&self) -> Iter<StreamData> {
+        self.stream_datas.iter()
     }
 
     pub fn append(&mut self, data: &[u8]) -> Result<u64> {

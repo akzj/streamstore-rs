@@ -51,7 +51,7 @@ fn main() {
         *count += 1;
 
         Some(Box::new(move |result| match result {
-            Ok(entry) => {
+            Ok(_entry) => {
                 //                log::info!("Append success: {:?}", entry);
                 let (lock, cvar) = &*cond;
                 let mut count = lock.lock().unwrap();

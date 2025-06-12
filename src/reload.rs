@@ -13,7 +13,7 @@ use std::{
 use crate::{
     entry::Decoder,
     errors,
-    mem_table::{GetStreamOffsetFn, MemTable},
+    mem_table::{GetStreamOffset, MemTable},
     segments::Segment,
 };
 
@@ -134,21 +134,24 @@ pub fn reload_wals(
 
     let offset_map = Arc::new(Mutex::new(offset_map.clone()));
 
-    let get_stream_offset_fn: GetStreamOffsetFn = Arc::new(Box::new({
+    // Create a closure to get the stream offset
+    let make_stream_offset_fn = || -> _ {
         let offset_map = offset_map.clone();
-        move |stream_id| match offset_map.lock().unwrap().get(&stream_id) {
-            Some(offset) => {
-                log::debug!("Get stream offset for stream_id {}: {}", stream_id, offset);
-                Ok(*offset)
+        Box::new({
+            move |stream_id| match offset_map.lock().unwrap().get(&stream_id) {
+                Some(offset) => {
+                    log::debug!("Get stream offset for stream_id {}: {}", stream_id, offset);
+                    Ok(*offset)
+                }
+                None => Ok(0), // Default to 0 if not found
             }
-            None => Ok(0), // Default to 0 if not found
-        }
-    }));
+        })
+    };
 
     let wals = list_wal_files(wal_path)?;
     let mut files = HashMap::new();
     let mut entry_index = 0;
-    let mut table = Rc::new(MemTable::new(&get_stream_offset_fn));
+    let mut table = Rc::new(MemTable::new(make_stream_offset_fn()));
     let mut tables = VecDeque::new();
     // Reload the WAL files
     for (filename, _entry_index) in &wals {
@@ -185,7 +188,7 @@ pub fn reload_wals(
 
                 tables.push_back(table.clone());
                 // create new segment
-                table = Rc::new(MemTable::new(&get_stream_offset_fn));
+                table = Rc::new(MemTable::new(make_stream_offset_fn()));
             }
             entry_index = entry.id;
             Ok(true)

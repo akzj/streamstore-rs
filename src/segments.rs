@@ -274,10 +274,10 @@ pub(crate) fn generate_segment(
         .iter()
         .for_each(|(_, stream_table)| {
             let stream_header = SegmentStreamHeader {
-                size: stream_table.size,
+                size: stream_table.size(),
                 crc64: stream_table.crc64(),
-                offset: stream_table.offset,
-                stream_id: stream_table.stream_id,
+                offset: stream_table.offset(),
+                stream_id: stream_table.stream_id(),
                 ..Default::default()
             };
             segment_stream_headers.push(stream_header);
@@ -347,10 +347,10 @@ pub(crate) fn generate_segment(
 
     // Write the stream data to the file
     for (_, stream_table) in table.get_stream_tables().iter() {
-        for stream_data in stream_table.stream_datas.iter() {
+        for stream_data in stream_table.stream_datas() {
             file.write_all(unsafe {
                 std::slice::from_raw_parts(
-                    stream_data.data.as_ptr() as *const u8,
+                    stream_data.data().as_ptr() as *const u8,
                     stream_data.size() as usize,
                 )
             })
@@ -540,11 +540,7 @@ fn test_segment_header_size() {
         std::mem::size_of::<SegmentStreamHeader>() as u64
     );
 
-    let get_stream_offset: crate::mem_table::GetStreamOffsetFn =
-        std::sync::Arc::new(Box::new(|_stream_id| Ok(0)));
-
-    let memtable = MemTable::new(&get_stream_offset);
-
+    let memtable = MemTable::new(Box::new(|_stream_id| Ok(0)));
     let mut entry_id = 0;
     for i in 0..10 {
         for _j in 0..1000 {

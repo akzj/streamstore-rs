@@ -17,7 +17,7 @@ use crate::{
     entry::{AppendEntryResultFn, DataType, Entry},
     errors::{self, new_stream_not_found},
     futures::AppendFuture,
-    mem_table::{GetStreamOffsetFn, MemTable, MemTableArc},
+    mem_table::{GetStreamOffset, MemTable, MemTableArc},
     metrics::{self},
     options::Options,
     reader::StreamReader,
@@ -46,7 +46,7 @@ pub struct StreamStoreInner {
 #[derive(Clone)]
 pub struct Store {
     inner: Arc<StreamStoreInner>,
-    wal: Arc<Wal>,
+    wal: Wal,
 }
 
 impl std::ops::Deref for Store {
@@ -200,13 +200,18 @@ impl StreamStoreInner {
         &self,
         write_segment_sender: SyncSender<(path::PathBuf, MemTableArc)>,
     ) -> () {
-        let get_stream_offset_fn: GetStreamOffsetFn = Arc::new(Box::new({
+        let get_stream_offset = || -> _ {
             let offsets = self.offsets.clone();
-            move |stream_id| match offsets.lock().unwrap().get(&stream_id) {
-                Some(offset) => Ok(*offset),
-                None => Ok(0), // Default to 0 if not found
-            }
-        }));
+            Box::new(
+                move |stream_id| match offsets.lock().unwrap().get(&stream_id) {
+                    Some(offset) => {
+                        log::debug!("Get stream offset for stream_id {}: {}", stream_id, offset);
+                        Ok(*offset)
+                    }
+                    None => Ok(0), // Default to 0 if not found
+                },
+            )
+        };
 
         loop {
             let entries = match self.entry_receiver.lock().unwrap().recv() {
@@ -241,7 +246,7 @@ impl StreamStoreInner {
                 if table.get_size() > self.config.max_table_size {
                     self.mem_tables.write().unwrap().push_back(table.clone());
                     self.table
-                        .store(Arc::new(MemTable::new(&get_stream_offset_fn.clone())));
+                        .store(Arc::new(MemTable::new(get_stream_offset())));
 
                     let filename = std::path::Path::new(&self.config.segment_path).join(format!(
                         "{}-{}.seg",
@@ -633,7 +638,7 @@ impl Store {
 
         let store = Store {
             inner: Arc::new(inner),
-            wal: Arc::new(wal),
+            wal: wal,
         };
 
         // start background thread
@@ -660,7 +665,6 @@ impl Store {
             .name("store::run".to_string())
             .spawn({
                 let _self = self.inner.clone();
-
                 move || {
                     _self.memtable_writer(sender);
                 }
